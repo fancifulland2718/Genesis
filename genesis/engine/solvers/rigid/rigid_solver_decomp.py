@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Literal
+﻿from typing import TYPE_CHECKING, Literal
 
 import gstaichi as ti
 import numpy as np
@@ -67,6 +67,57 @@ def _sanitize_sol_params(
 
 @ti.data_oriented
 class RigidSolver(Solver):
+    """刚体求解器 (Decomposed Version)
+
+    本文件是 Genesis 刚体物理求解流水线 (rigid body solver) 的『分解版实现』，
+    将经典 Featherstone / MuJoCo 风格刚体动力学、约束、接触、休眠 (hibernation) 等
+    逻辑拆分为大量 `@ti.kernel` / `@ti.func` 以便：
+    1. 代码生成 / 编译缓存 (cache key) 的精准最小化；
+    2. 更灵活的求解/裁剪；
+    3. 多种积分器与约束求解策略组合。
+
+    主要职责:
+    - 管理场景中所有 RigidEntity/Link/Joint/Geom 的结构化数据 (SoA)；
+    - 初始化质量矩阵、动力学状态、几何/可视化数据、SDF/碰撞器/约束求解器；
+    - 在每个 substep 中执行: 运动学更新 -> 质量矩阵/力项构建 -> 约束/碰撞装配与求解 -> 积分 -> 休眠/唤醒 -> 几何更新；
+    - 提供面向外部的控制 / 查询 / 设置接口 (位置、速度、力、质量属性、求解参数等)；
+    - 提供 IK、无人机桨叶、焊接约束等特殊功能封装。
+
+    关于『核心子步骤 (substep) 流水线』(简化说明):
+        substep()
+          ├─ kernel_step_1():
+          │    ├─ (可选) Mujoco 兼容模式下的笛卡尔更新 (forward kinematics + COM + velocity)
+          │    └─ func_forward_dynamics():
+          │         1) func_compute_mass_matrix()  质量/广义惯量 (可含近似隐式阻尼)
+          │         2) func_factor_mass()         质量矩阵分解 (L, D) 以便快速求解 Mx=b
+          │         3) func_torque_and_passive_force()  控制力 + 被动力(阻尼/弹性/重力等) 装配
+          │         4) func_update_acc(update_cacc=False)  计算中间加速度 (cdd)
+          │         5) func_update_force() + func_bias_force() -> 得到广义力向量
+          │         6) func_compute_qacc()  由分解质量矩阵解出加速度
+          ├─ 约束/碰撞阶段:
+          │    _func_constraint_force():
+          │        clear -> (接触检测 collider.detection()) -> 组装各类约束 -> constraint_solver.resolve()
+          └─ kernel_step_2():
+               1) func_update_acc(update_cacc=True)  最终加速度与经典加速度
+               2) (非 approximate_implicitfast 时) func_implicit_damping()  二次修正
+               3) func_integrate(): 积分 q, qdot (支持隐式/快速近似)
+               4) (休眠相关) func_hibernate__... + func_aggregate_awake_entities()
+               5) (若非 Mujoco 兼容模式) 再次更新笛卡尔空间 (含 geoms pose)
+
+    休眠 (Hibernation) 机制:
+        - 根据加速度/速度阈值将整座“接触岛 (contact island)”或实体标记为休眠, 以减少计算。
+        - 唤醒发生在检测到外力 / 控制力 / 新接触等事件。
+
+    命名约定说明:
+        links_state / info 等: *_info 为静态/结构数据 (拓扑/常量), *_state 为随时间演化的状态。
+        *_global_info: 跨实体共享的全局量 (qpos、mass matrix、重力、batch 维度等)。
+        *_cache_key: 用于编译 cache 的静态配置镜像。
+        cdof_xxx: body / joint 空间中的广义坐标基向量 (动量学基)；cxx 前缀多代表组合或“以 COM / root COM 表达”。
+
+    注意:
+        由于该文件极长，下面对每一类核心函数组集中添加中文概述；简短的 @ti.func 内部工具函数
+        若语义直观则仅在分组注释中说明，不对每行重复解释。
+    """
     # override typing
     _entities: list[RigidEntity] = gs.List()
 
@@ -926,6 +977,15 @@ class RigidSolver(Solver):
             self.constraint_solver = ConstraintSolver(self)
 
     def substep(self):
+        """单次物理子步 (substep).
+
+        执行顺序:
+            1) kernel_step_1: 计算质量矩阵/动力学广义力与加速度 (不含最终积分), 可能先做笛卡尔空间更新;
+            2) (可选) 约束 + 碰撞装配与求解 (_func_constraint_force): 填充 constraint forces;
+            3) kernel_step_2: 最终加速度更新、阻尼/隐式修正、积分、休眠判定、几何更新。
+
+        若耦合器 (coupler) 为 SAP 类型，则使用不同的速度/加速度同步策略。
+        """
         # from genesis.utils.tools import create_timer
         from genesis.engine.couplers import SAPCoupler
 
@@ -991,6 +1051,13 @@ class RigidSolver(Solver):
         return collision_pairs
 
     def _func_constraint_force(self):
+        """
+            约束阶段主函数.
+                主要动作:
+                    - 清空上一帧约束/接触缓存
+                    - (非禁用情况下) 装配 equality / frictionloss / collision / joint limit 等约束
+                    - 调用 constraint_solver.resolve() 求解拉格朗日乘子并回写约束广义力
+        """
         # from genesis.utils.tools import create_timer
 
         # timer = create_timer(name="constraint_force", level=2, ti_sync=True, skip_first_call=True)
@@ -1026,6 +1093,11 @@ class RigidSolver(Solver):
         self.collider._collider_state.n_contacts.fill(0)
 
     def _func_forward_dynamics(self):
+        """Forward Dynamics 主入口 (未直接用于最终子步, 由 kernel_forward_dynamics 包装).
+
+        包装 kernel_forward_dynamics, 其内部执行:
+            func_forward_dynamics -> 质量矩阵、力项、加速度 (不含最终隐式阻尼修正)。
+        """
         kernel_forward_dynamics(
             links_state=self.links_state,
             links_info=self.links_info,
@@ -1766,7 +1838,7 @@ class RigidSolver(Solver):
 
     def set_global_sol_params(self, sol_params, *, unsafe=False):
         """
-        Set constraint solver parameters.
+        设置全局约束求解参数 (所有 geom / joint / equality 的默认值).
 
         Reference: https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
 
@@ -1792,7 +1864,7 @@ class RigidSolver(Solver):
 
     def set_sol_params(self, sol_params, geoms_idx=None, envs_idx=None, *, joints_idx=None, eqs_idx=None, unsafe=False):
         """
-        Set constraint solver parameters.
+        设置局部约束求解参数.
 
         Reference: https://mujoco.readthedocs.io/en/latest/modeling.html#solver-parameters
 
@@ -2123,10 +2195,10 @@ class RigidSolver(Solver):
 
     def get_links_root_COM(self, links_idx=None, envs_idx=None, *, unsafe=False):
         """
-        Returns the center of mass (COM) of the entire kinematic tree to which the specified links belong.
+        返回指定 link 所在整棵运动树 (entity) 的整体质心 (root COM).
 
-        This corresponds to the global COM of each entity, assuming a single-rooted structure — that is, as long as no
-        two successive links are connected by a free-floating joint (ie a joint that allows all 6 degrees of freedom).
+        说明:
+            若该实体是单根结构 (没有连续自由 6DoF 断开形成多个根), 则即为该 entity 的全局质心。
         """
         tensor = ti_to_torch(self.links_state.root_COM, envs_idx, links_idx, transpose=True, unsafe=unsafe)
         return tensor.squeeze(0) if self.n_envs == 0 else tensor
@@ -2646,6 +2718,7 @@ def kernel_compute_mass_matrix(
     static_rigid_sim_cache_key: array_class.StaticRigidSimCacheKey,
     decompose: ti.template(),
 ):
+    # 组装质量矩阵并可选执行分解（decompose=True 时调用 factor）。
     func_compute_mass_matrix(
         implicit_damping=False,
         links_state=links_state,
@@ -3970,6 +4043,7 @@ def func_forward_dynamics(
     static_rigid_sim_config: ti.template(),
     contact_island_state: array_class.ContactIslandState,
 ):
+    # 前向动力学主流程（见顶部总览 Pipeline#Forward Dynamics）
     func_compute_mass_matrix(
         implicit_damping=ti.static(static_rigid_sim_config.integrator == gs.integrator.approximate_implicitfast),
         links_state=links_state,
