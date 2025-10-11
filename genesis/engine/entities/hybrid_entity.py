@@ -28,6 +28,15 @@ from .mpm_entity import MPMEntity
 class HybridEntity(Entity):
     """
     A hybrid simulation entity composed of both rigid and soft components.
+    由刚体和软体组件组成的混合仿真实体。
+    
+    该类封装了初始化、耦合和模拟物理混合对象的逻辑，该对象同时具有刚体部分（例如来自 URDF 或网格）
+    和软体材料（例如 MPM）。耦合允许在仿真过程中刚体和软体部分之间进行双向的力和运动交互。
+    
+    适用场景：
+    - 软体机器人（刚性骨架 + 软体肌肉）
+    - 机械手抓取软体物体
+    - 生物力学仿真（骨骼 + 软组织）
 
     This class encapsulates logic for initializing, coupling, and simulating
     a physically hybrid object that has rigid bodies (e.g., from URDF or meshes)
@@ -38,15 +47,20 @@ class HybridEntity(Entity):
     ----------
     idx : int
         The index of the entity within the scene.
+        实体在场景中的索引。
     scene : genesis.Scene
         The simulation scene where the entity is added.
+        添加实体的仿真场景。
     material : genesis.materials.Hybrid
         The hybrid material that includes both rigid and soft sub-materials,
         and defines coupling behavior.
+        包含刚体和软体子材料并定义耦合行为的混合材料。
     morph : genesis.morphs.Morph
         The shape/morphology of the entity. Must be either a `URDF` or `Mesh`.
+        实体的形状/形态。必须是 `URDF` 或 `Mesh`。
     surface : genesis.surfaces.Surface
         The surface properties applied to the soft part of the entity.
+        应用于实体软体部分的表面属性。
     """
 
     def __init__(

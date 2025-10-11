@@ -10,6 +10,19 @@ from .avatar_link import AvatarLink
 
 @ti.data_oriented
 class AvatarEntity(RigidEntity):
+    """
+    Avatar entity for simulating humanoid or character models.
+    用于模拟人形或角色模型的化身实体。
+    
+    AvatarEntity 继承自 RigidEntity，专门用于表示可控制的人形角色或虚拟化身。
+    适用于虚拟现实、动作捕捉、角色动画等场景，支持复杂的运动学和动力学控制。
+    
+    特点：
+    - 支持多关节人形结构
+    - 可以从动作捕捉数据驱动
+    - 适用于 VR/AR 应用
+    - 支持角色动画和交互
+    """
     def add_link(
         self,
         name: str,
@@ -24,32 +37,43 @@ class AvatarEntity(RigidEntity):
     ) -> AvatarLink:
         """
         Add a new link (AvatarLink) to the entity.
+        向实体添加新的连杆（AvatarLink）。
 
         Parameters
         ----------
         name : str
             Name of the link.
+            连杆名称。
         pos : array-like
             Position of the link in world or parent frame.
+            连杆在世界坐标系或父坐标系中的位置。
         quat : array-like
             Orientation (quaternion) of the link.
+            连杆的方向（四元数）。
         inertial_pos : array-like
             Position of the inertial frame relative to the link.
+            惯性坐标系相对于连杆的位置。
         inertial_quat : array-like
             Orientation of the inertial frame.
+            惯性坐标系的方向。
         inertial_i : array-like
             Inertia tensor in the local frame.
+            局部坐标系中的惯性张量。
         inertial_mass : float
             Mass of the link.
+            连杆的质量。
         parent_idx : int
             Index of the parent link in the kinematic tree.
+            运动学树中父连杆的索引。
         invweight : np array of 2 float elements
             Inverse weight for optimization or simulation purposes.
+            用于优化或仿真目的的逆权重。
 
         Returns
         -------
         link : AvatarLink
             The created AvatarLink instance.
+            创建的 AvatarLink 实例。
         """
         link = AvatarLink(
             entity=self,

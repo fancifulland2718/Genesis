@@ -12,6 +12,19 @@ from .rigid_entity import RigidEntity
 
 @ti.data_oriented
 class DroneEntity(RigidEntity):
+    """
+    Drone entity for simulating quadcopters and multirotors.
+    用于模拟四旋翼和多旋翼无人机的实体类。
+    
+    该类继承自 RigidEntity，增加了无人机特有的功能：
+    - 螺旋桨转速控制（RPM）
+    - 推力和力矩系数（KF、KM）
+    - 螺旋桨动画可视化
+    - 基于物理的飞行动力学
+    
+    支持不同的无人机模型（如 RACE 模型），适用于无人机控制、路径规划、
+    强化学习等研究场景。
+    """
     def _load_scene(self, morph, surface):
         super()._load_scene(morph, surface)
 
@@ -49,18 +62,23 @@ class DroneEntity(RigidEntity):
     def set_propellels_rpm(self, propellels_rpm):
         """
         Set the RPM (revolutions per minute) for each propeller in the drone.
+        设置无人机每个螺旋桨的 RPM（每分钟转数）。
 
         Parameters
         ----------
         propellels_rpm : array-like or torch.Tensor
             A tensor or array of shape (n_propellers,) or (n_envs, n_propellers) specifying
             the desired RPM values for each propeller. Must be non-negative.
+            形状为 (n_propellers,) 或 (n_envs, n_propellers) 的张量或数组，
+            指定每个螺旋桨的期望 RPM 值。必须为非负数。
 
         Raises
         ------
         RuntimeError
             If the method is called more than once per simulation step, or if the input shape
             does not match the number of propellers, or contains negative values.
+            如果在每个仿真步骤中多次调用该方法，或输入形状与螺旋桨数量不匹配，
+            或包含负值。
         """
         if self._prev_prop_t == self.sim.cur_step_global:
             gs.raise_exception("`set_propellels_rpm` can only be called once per step.")
@@ -88,8 +106,10 @@ class DroneEntity(RigidEntity):
     def update_propeller_vgeoms(self):
         """
         Update the visual geometry of the propellers for animation based on their current rotation.
+        根据螺旋桨的当前旋转更新其可视化几何以实现动画效果。
 
         This method is a no-op if animation is disabled due to missing visual geometry.
+        如果由于缺少可视化几何而禁用动画，则此方法不执行任何操作。
         """
         if self._animate_propellers:
             self.solver.update_drone_propeller_vgeoms(
