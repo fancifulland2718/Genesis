@@ -13,6 +13,11 @@ from genesis.engine.entities.particle_entity import ParticleEntity
 class PBDBaseEntity(ParticleEntity):
     """
     Base class for PBD entity.
+    基于位置的动力学（Position-Based Dynamics, PBD）实体基类。
+    
+    PBD 是一种约束求解方法，直接操作位置而非力和加速度。
+    特别适用于实时仿真，如布料、软体、绳索等的模拟。
+    该基类提供粒子位置、速度、激活状态等的控制接口。
     """
 
     @gs.assert_built
@@ -75,15 +80,21 @@ class PBDBaseEntity(ParticleEntity):
     def fix_particles(self, particles_idx_local, envs_idx=None, zero_vel=True, *, unsafe=False):
         """
         Fix the position of some particles in the simulation.
+        固定仿真中某些粒子的位置。
+        
+        使粒子在仿真中保持静止，不受外力影响。
 
         Parameters
         ----------
         particles_idx_local : int | array_like, shape (N,)
             Index of the particles relative to this entity.
+            相对于该实体的粒子索引。
         envs_idx : None | int | array_like, shape (M,), optional
             The indices of the environments to set. If None, all environments will be set. Defaults to None.
+            要设置的环境索引。如果为 None，将设置所有环境。默认为 None。
         zero_vel : bool, optional
             Whether to zero the velocity of the particles. Defaults to True.
+            是否将粒子的速度归零。默认为 True。
         """
         if zero_vel:
             self.set_particles_vel(torch.zeros([3]), particles_idx_local, envs_idx, unsafe=unsafe)

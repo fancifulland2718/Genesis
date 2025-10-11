@@ -34,6 +34,20 @@ if TYPE_CHECKING:
 class RigidEntity(Entity):
     """
     Entity class in rigid body systems. One rigid entity can be a robot, a terrain, a floating rigid body, etc.
+    刚体系统中的实体类。一个刚体实体可以是机器人、地形、浮动刚体等。
+    
+    RigidEntity 是 Genesis 中最复杂的实体类型，采用组件化设计：
+    - RigidLink（连杆）: 表示刚体部件，包含质量、惯性、位置等属性
+    - RigidJoint（关节）: 连接连杆，定义运动约束和自由度
+    - RigidGeom（几何体）: 碰撞和视觉几何
+    - RigidEquality（约束）: 额外的等式约束
+    
+    支持的功能：
+    - 多关节机器人仿真
+    - 碰撞检测与响应
+    - 运动学与动力学计算
+    - 传感器模拟（关节角度、速度、力矩等）
+    - 可微分仿真（支持梯度计算）
     """
 
     # override typing

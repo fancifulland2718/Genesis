@@ -188,11 +188,20 @@ class ParticleEntity(Entity):
     def init_sampler(self):
         """
         Initialize the particle sampling strategy based on the material's sampler field.
+        根据材料的采样器字段初始化粒子采样策略。
+        
+        支持的采样器类型：
+        - 'regular': 规则网格采样
+        - 'random': 随机采样
+        - 'pbs' 或 'pbs-<sdf_res>': 基于 Poisson 球采样（Physics-based Sampling）
+        
+        如果采样器设置为 'pbs' 且未指定 SDF 分辨率，默认使用 32。
 
         Raises
         ------
         GenesisException
             If the specified sampler is not supported or incorrectly formatted.
+            如果指定的采样器不受支持或格式不正确。
         """
         self.sampler = self._material.sampler
 
@@ -215,6 +224,10 @@ class ParticleEntity(Entity):
     def init_tgt_keys(self):
         """
         Initialize the list of keys used for controlling entity state (position, velocity, activation).
+        初始化用于控制实体状态的键列表（位置、速度、激活状态）。
+        
+        这些键用于在仿真过程中跟踪和更新实体的目标状态。
+        默认包括：'pos'（位置）、'vel'（速度）、'act'（激活状态）。
         """
         self._tgt_keys = ("pos", "vel", "act")
 
@@ -270,11 +283,23 @@ class ParticleEntity(Entity):
     def sample(self):
         """
         Sample particles from the morph based on its type and the specified sampler.
+        根据形状类型和指定的采样器从形状中采样粒子。
+        
+        采样管线：
+        1. 初始化采样器（init_sampler）
+        2. 根据形状类型进行采样：
+           - MeshSet: 对多个网格文件分别采样并合并
+           - Primitive/Mesh: 使用网格的 particlize 方法采样
+           - Nowhere: 创建无位置的占位粒子
+        3. 检查采样结果的有效性
+        4. 验证粒子是否在求解器域内
+        5. 初始化粒子相关的网格顶点和面（如果需要蒙皮）
 
         Raises
         ------
         GenesisException
             If no particles are sampled, or sampled particles lie outside the solver's domain.
+            如果未采样到粒子，或采样的粒子位于求解器域之外。
         """
         self.init_sampler()
 

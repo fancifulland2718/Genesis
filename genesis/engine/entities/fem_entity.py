@@ -20,31 +20,46 @@ from .base_entity import Entity
 class FEMEntity(Entity):
     """
     A finite element method (FEM)-based entity for deformable simulation.
+    基于有限元法（Finite Element Method, FEM）的可变形实体。
+    
+    FEM 是一种数值方法，用于求解偏微分方程，特别适用于固体力学和结构分析。
+    该类使用四面体单元离散化可变形物体，通过求解器处理弹性变形、塑性变形等。
 
     This class represents a deformable object using tetrahedral elements. It interfaces with
     the physics solver to handle state updates, checkpointing, gradients, and actuation
     for physics-based simulation in batched environments.
+    该类使用四面体单元表示可变形物体。它与物理求解器交互，处理批量环境中的
+    状态更新、检查点、梯度和激励等物理模拟。
 
     Parameters
     ----------
     scene : Scene
         The simulation scene that this entity belongs to.
+        该实体所属的仿真场景。
     solver : Solver
         The physics solver instance used for simulation.
+        用于仿真的物理求解器实例。
     material : Material
         The material properties defining elasticity, density, etc.
+        定义弹性、密度等的材料属性。
     morph : Morph
         The morph specification that defines the entity's shape.
+        定义实体形状的形状规范。
     surface : Surface
         The surface mesh associated with the entity (for rendering or collision).
+        与实体关联的表面网格（用于渲染或碰撞）。
     idx : int
         Unique identifier of the entity within the scene.
+        实体在场景中的唯一标识符。
     v_start : int, optional
         Starting index of this entity's vertices in the global vertex array (default is 0).
+        该实体顶点在全局顶点数组中的起始索引（默认为 0）。
     el_start : int, optional
         Starting index of this entity's elements in the global element array (default is 0).
+        该实体单元在全局单元数组中的起始索引（默认为 0）。
     s_start : int, optional
         Starting index of this entity's surface triangles in the global surface array (default is 0).
+        该实体表面三角形在全局表面数组中的起始索引（默认为 0）。
     """
 
     def __init__(self, scene, solver, material, morph, surface, idx, v_start=0, el_start=0, s_start=0):
@@ -100,20 +115,27 @@ class FEMEntity(Entity):
     def set_position(self, pos):
         """
         Set the target position(s) for the FEM entity.
+        设置 FEM 实体的目标位置。
 
         Parameters
         ----------
         pos : torch.Tensor or array-like
             The desired position(s). Can be:
+            期望的位置。可以是：
             - (3,): a single COM offset vector.
+                    单个质心偏移向量。
             - (n_vertices, 3): per-vertex positions for all vertices.
+                               所有顶点的逐顶点位置。
             - (n_envs, 3): per-environment COM offsets.
+                           每个环境的质心偏移。
             - (n_envs, n_vertices, 3): full batched per-vertex positions.
+                                       完整批量的逐顶点位置。
 
         Raises
         ------
         Exception
             If the tensor shape is not supported.
+            如果张量形状不受支持。
         """
         self._assert_active()
         gs.logger.warning("Manally setting element positions. This is not recommended and could break gradient flow.")
@@ -144,20 +166,27 @@ class FEMEntity(Entity):
     def set_velocity(self, vel):
         """
         Set the target velocity(ies) for the FEM entity.
+        设置 FEM 实体的目标速度。
 
         Parameters
         ----------
         vel : torch.Tensor or array-like
             The desired velocity(ies). Can be:
+            期望的速度。可以是：
             - (3,): a global velocity vector for all vertices.
+                    所有顶点的全局速度向量。
             - (n_vertices, 3): per-vertex velocities.
+                               逐顶点速度。
             - (n_envs, 3): per-environment velocities broadcast to all vertices.
+                           每个环境的速度广播到所有顶点。
             - (n_envs, n_vertices, 3): full batched per-vertex velocities.
+                                       完整批量的逐顶点速度。
 
         Raises
         ------
         Exception
             If the tensor shape is not supported.
+            如果张量形状不受支持。
         """
         self._assert_active()
         gs.logger.warning("Manually setting element velocities. This is not recommended and could break gradient flow.")

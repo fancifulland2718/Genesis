@@ -11,6 +11,21 @@ from .particle_entity import assert_active, ParticleEntity
 
 
 def assert_muscle(method):
+    """
+    装饰器：确保实体使用肌肉材料才能调用方法。
+    
+    用于包装只有肌肉材料才支持的方法（如设置激活值），如果材料类型不匹配则抛出异常。
+    
+    Parameters
+    ----------
+    method : callable
+        需要肌肉材料的方法
+        
+    Returns
+    -------
+    callable
+        包装后的方法
+    """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         if not isinstance(self.material, gs.materials.MPM.Muscle):
@@ -24,29 +39,44 @@ def assert_muscle(method):
 class MPMEntity(ParticleEntity):
     """
     MPM-based particle entity.
+    基于物质点法（Material Point Method, MPM）的粒子实体。
+    
+    MPM 是一种混合拉格朗日-欧拉方法，结合了粒子和网格的优点。
+    适用于模拟大变形、多相材料、流体-固体耦合等复杂物理现象。
+    支持的材料类型包括：雪、沙、液体、肌肉等。
 
     Parameters
     ----------
     scene : Scene
         Scene object this entity belongs to.
+        实体所属的场景对象。
     solver : Solver
         The solver responsible for simulating this entity.
+        负责模拟该实体的求解器。
     material : Material
         Material used to determine physical behavior (e.g., Snow, Sand, Muscle).
+        用于确定物理行为的材料（例如雪、沙、肌肉）。
     morph : Morph
         Shape description used for particle sampling.
+        用于粒子采样的形状描述。
     surface : Surface
         Surface or texture representation.
+        表面或纹理表示。
     particle_size : float
         Particle size for discretization.
+        离散化的粒子大小。
     idx : int
         Unique index of the entity.
+        实体的唯一索引。
     particle_start : int
         Starting particle index.
+        粒子起始索引。
     vvert_start : int
         Start index for visual vertices (unused if no skinning).
+        可视化顶点的起始索引（如果不需要蒙皮则不使用）。
     vface_start : int
         Start index for visual faces (unused if no skinning).
+        可视化面的起始索引（如果不需要蒙皮则不使用）。
     """
 
     def __init__(
@@ -72,9 +102,13 @@ class MPMEntity(ParticleEntity):
     def init_tgt_keys(self):
         """
         Initialize target keys used for buffer-based state tracking.
+        初始化用于基于缓冲区的状态跟踪的目标键。
 
         Sets up the list of keys for target states, including velocity, position, activeness, and finally actuation (for
         muscle only).
+        设置目标状态的键列表，包括速度、位置、激活状态，以及激励值（仅限肌肉材料）。
+        
+        对于肌肉材料，增加 'actu'（激励）键用于控制肌肉收缩。
         """
         if isinstance(self.material, gs.materials.MPM.Muscle):
             self._tgt_keys = ("pos", "vel", "act", "actu")
