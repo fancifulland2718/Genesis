@@ -18,6 +18,21 @@ from .base_entity import Entity
 
 
 def assert_active(method):
+    """
+    装饰器：确保实体处于激活状态才能调用方法。
+    
+    用于包装需要实体激活后才能使用的方法，如果实体未激活则抛出异常。
+    
+    Parameters
+    ----------
+    method : callable
+        需要确保实体激活的方法
+        
+    Returns
+    -------
+    callable
+        包装后的方法
+    """
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
         if not self.active:
