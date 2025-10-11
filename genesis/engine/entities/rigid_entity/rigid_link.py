@@ -23,6 +23,16 @@ if TYPE_CHECKING:
 class RigidLink(RBC):
     """
     RigidLink class. One RigidEntity consists of multiple RigidLinks, each of which is a rigid body and could consist of multiple RigidGeoms (`link.geoms`, for collision) and RigidVisGeoms (`link.vgeoms` for visualization).
+    刚体连杆类。一个 RigidEntity 由多个 RigidLink 组成，每个连杆是一个刚体，可以包含多个 RigidGeom（用于碰撞）和 RigidVisGeom（用于可视化）。
+    
+    RigidLink 表示机器人或刚体系统中的一个刚性部件（连杆），具有：
+    - 质量和惯性属性
+    - 位置和姿态（位姿）
+    - 碰撞几何体集合
+    - 可视化几何体集合
+    - 父子关节连接关系
+    
+    每个连杆通过关节（Joint）连接到父连杆，形成运动学树结构。
     """
 
     def __init__(

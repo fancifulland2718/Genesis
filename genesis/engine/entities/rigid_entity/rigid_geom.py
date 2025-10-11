@@ -30,6 +30,23 @@ if TYPE_CHECKING:
 class RigidGeom(RBC):
     """
     A `RigidGeom` is the basic building block of a `RigidEntity` for collision checking. It is usually constructed from a single mesh. This can be accessed via `link.geoms`.
+    RigidGeom 是 RigidEntity 进行碰撞检测的基本构建块。通常从单个网格构造。可通过 link.geoms 访问。
+    
+    RigidGeom 表示连杆上的一个几何体，用于：
+    - 碰撞检测和响应
+    - 物理接触计算
+    - 摩擦和弹性模拟
+    
+    每个几何体包含：
+    - 网格数据（顶点、面、边）
+    - 碰撞属性（摩擦系数、接触类型）
+    - 耦合参数（软度、摩擦、恢复系数）
+    - 初始位姿
+    
+    支持多种几何类型：
+    - 网格（Mesh）: 任意形状的三角网格
+    - 基本体（Primitive）: 球体、立方体、圆柱等
+    - 凸包（Convex Hull）
     """
 
     def __init__(
