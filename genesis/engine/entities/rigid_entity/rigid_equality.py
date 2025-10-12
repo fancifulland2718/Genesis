@@ -10,6 +10,20 @@ from genesis.repr_base import RBC
 class RigidEquality(RBC):
     """
     Equality class for rigid body entities.
+    刚体实体的等式约束类。
+    
+    RigidEquality 表示两个连杆之间的等式约束，用于：
+    - 约束相对位置和方向
+    - 模拟固定连接（如焊接）
+    - 实现复杂的机械约束
+    
+    等式约束通过求解器参数控制约束的强度和柔软度。
+    常用于闭环机构、平行机构或需要额外约束的系统。
+    
+    约束类型可能包括：
+    - 连接约束（Connect）: 连接两个连杆的特定点
+    - 焊接约束（Weld）: 完全固定两个连杆的相对位姿
+    - 其他自定义约束
     """
 
     def __init__(
@@ -43,6 +57,9 @@ class RigidEquality(RBC):
     def set_sol_params(self, sol_params):
         """
         Set the solver parameters of this equality constraint.
+        设置此等式约束的求解器参数。
+        
+        求解器参数控制约束的行为，如刚度、阻尼等。
         """
         if self.is_built:
             self._solver.set_sol_params(sol_params[..., None, :], eqs_idx=self._idx, envs_idx=None, unsafe=False)

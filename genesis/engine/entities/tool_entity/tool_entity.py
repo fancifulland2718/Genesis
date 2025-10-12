@@ -17,7 +17,21 @@ from .mesh import Mesh
 
 @ti.data_oriented
 class ToolEntity(Entity):
-    # Mesh-based tool body entity
+    """
+    Mesh-based tool body entity.
+    基于网格的工具体实体。
+    
+    ToolEntity 用于表示可控制的工具物体（如夹爪、手术工具、操纵杆等）。
+    该实体可以精确控制位置、方向、速度和角速度，适用于需要外部控制的工具模拟。
+    
+    特点：
+    - 直接控制位姿（位置和四元数）
+    - 支持速度和角速度设置
+    - 可用于机器人末端执行器
+    - 适合抓取、操纵等任务
+    
+    注意：ToolEntity 不受物理约束控制，而是由用户直接设置状态。
+    """
     def __init__(
         self,
         scene,
@@ -45,6 +59,16 @@ class ToolEntity(Entity):
         self.latest_pos = ti.Vector.field(3, dtype=gs.ti_float, shape=(1))
 
     def init_tgt_vars(self):
+        """
+        Initialize target variables for storing next-step targets.
+        初始化用于存储下一步目标的目标变量。
+        
+        目标变量包括：
+        - pos: 目标位置
+        - quat: 目标四元数（姿态）
+        - vel: 目标线速度
+        - ang: 目标角速度
+        """
         # temp variable to store targets for next step
         self._tgt = {
             "pos": None,

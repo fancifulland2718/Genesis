@@ -12,6 +12,16 @@ from genesis.repr_base import RBC
 class Emitter(RBC):
     """
     A particle emitter for fluid or material simulation.
+    用于流体或材料仿真的粒子发射器。
+    
+    发射器管理将粒子生成到仿真域中，允许定向或全向发射，支持各种液滴形状。
+    提供重置、基于形状的发射和球形全向发射等功能。
+    
+    适用场景：
+    - 水流、喷泉模拟
+    - 喷射、喷涂效果
+    - 粒子系统动画
+    - 流体注入实验
 
     The Emitter manages the generation of particles into the simulation domain, allowing directional or omnidirectional
     emissions with various droplet shapes. It supports resetting, shape-based emission, and spherical omni-emission.
@@ -20,6 +30,7 @@ class Emitter(RBC):
     ----------
     max_particles : int
         The maximum number of particles that this emitter can handle.
+        该发射器可以处理的最大粒子数。
     """
 
     def __init__(self, max_particles):
@@ -37,11 +48,13 @@ class Emitter(RBC):
     def set_entity(self, entity):
         """
         Assign an entity to the emitter and initialize relevant simulation and solver references.
+        将实体分配给发射器并初始化相关的仿真和求解器引用。
 
         Parameters
         ----------
         entity : Entity
             The entity to associate with the emitter. This entity should contain the solver, simulation context, and particle sampler.
+            与发射器关联的实体。该实体应包含求解器、仿真上下文和粒子采样器。
         """
         self._entity = entity
         self._sim = entity.sim
@@ -52,6 +65,9 @@ class Emitter(RBC):
     def reset(self):
         """
         Reset the emitter's internal particle index to start emitting from the beginning.
+        重置发射器的内部粒子索引，从头开始发射。
+        
+        清空已发射的粒子计数，允许重新使用粒子缓冲区。
         """
         self._next_particle = 0
 
@@ -68,30 +84,43 @@ class Emitter(RBC):
     ):
         """
         Emit particles in a specified shape and direction from a nozzle.
+        从喷嘴以指定的形状和方向发射粒子。
+        
+        该方法创建一个具有给定形状的液滴，并沿指定方向以指定速度发射粒子。
+        粒子被添加到仿真中，并继承发射速度。
 
         Parameters
         ----------
         droplet_shape : str
             The shape of the emitted droplet. Options: "circle", "sphere", "square", "rectangle".
+            发射液滴的形状。选项："circle"（圆形）、"sphere"（球形）、"square"（正方形）、"rectangle"（矩形）。
         droplet_size : float or tuple
             Size of the droplet. A single float for symmetric shapes, or a tuple of (width, height) for rectangles.
+            液滴的大小。对称形状为单个浮点数，矩形为 (宽度, 高度) 元组。
         droplet_length : float, optional
             Length of the droplet in the emitting direction. If None, calculated from speed and simulation timing.
+            液滴在发射方向上的长度。如果为 None，则根据速度和仿真时间计算。
         pos : tuple of float
             World position of the nozzle from which the droplet is emitted.
+            发射液滴的喷嘴的世界坐标位置。
         direction : tuple of float
             Direction vector of the emitted droplet.
+            发射液滴的方向向量。
         theta : float
             Rotation angle (in radians) around the droplet axis.
+            围绕液滴轴的旋转角度（弧度）。
         speed : float
             Emission speed of the particles.
+            粒子的发射速度。
         p_size : float, optional
             Particle size used for filling the droplet. Defaults to the solver's particle size.
+            用于填充液滴的粒子大小。默认为求解器的粒子大小。
 
         Raises
         ------
         Exception
             If the shape is unsupported or the emission would place particles outside the simulation boundary.
+            如果形状不受支持或发射会将粒子放置在仿真边界之外。
         """
         assert self._entity is not None
 

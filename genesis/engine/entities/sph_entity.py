@@ -11,25 +11,38 @@ from .particle_entity import ParticleEntity
 class SPHEntity(ParticleEntity):
     """
     SPH-based particle entity.
+    基于光滑粒子流体动力学（Smoothed Particle Hydrodynamics, SPH）的粒子实体。
+    
+    SPH 是一种无网格拉格朗日方法，特别适用于流体仿真。
+    通过粒子之间的相互作用力来模拟流体的连续性、压力、粘性等物理特性。
+    常用于水、液体等流体的模拟。
 
     Parameters
     ----------
     scene : Scene
         The simulation scene.
+        仿真场景。
     solver : Solver
         The solver handling the simulation logic.
+        处理仿真逻辑的求解器。
     material : Material
         Material properties (e.g., density, stiffness).
+        材料属性（例如密度、刚度）。
     morph : Morph
         Morphological configuration.
+        形态配置。
     surface : Surface
         Surface constraints or geometry.
+        表面约束或几何。
     particle_size : float
         The size of each particle.
+        每个粒子的大小。
     idx : int
         Index of this entity in the scene.
+        该实体在场景中的索引。
     particle_start : int
         Start index for the particles belonging to this entity.
+        属于该实体的粒子的起始索引。
     """
 
     def __init__(self, scene, solver, material, morph, surface, particle_size, idx, particle_start):
@@ -40,11 +53,18 @@ class SPHEntity(ParticleEntity):
     def init_sampler(self):
         """
         Initialize the particle sampler based on the material's sampling method.
+        根据材料的采样方法初始化粒子采样器。
+        
+        支持的采样器类型：
+        - 'regular': 规则网格采样
+        - 'random': 随机采样  
+        - 'pbs' 或 'pbs-<sdf_res>': 基于 Poisson 球采样
 
         Raises
         ------
         GenesisException
             If the sampler is not one of the supported types: 'regular', 'pbs', or 'pbs-sdf_res'.
+            如果采样器不是支持的类型之一。
         """
         self.sampler = self._material.sampler
 

@@ -11,6 +11,21 @@ from genesis.repr_base import RBC
 class RigidJoint(RBC):
     """
     Joint class for rigid body entities. Each RigidLink is connected to its parent link via a RigidJoint.
+    刚体实体的关节类。每个 RigidLink 通过一个 RigidJoint 连接到其父连杆。
+    
+    RigidJoint 定义了连杆之间的运动约束和自由度（DOF），包括：
+    - 关节类型（旋转、滑动、固定、球形等）
+    - 关节位置和方向
+    - 运动限制（位置限制、速度限制）
+    - 动力学参数（阻尼、刚度、摩擦）
+    - 控制参数（PD 控制增益、力矩范围）
+    
+    支持的关节类型包括：
+    - FIXED: 固定关节（无自由度）
+    - HINGE/REVOLUTE: 旋转关节（1 个旋转自由度）
+    - SLIDE/PRISMATIC: 滑动关节（1 个平移自由度）
+    - BALL/SPHERICAL: 球形关节（3 个旋转自由度）
+    - FREE: 自由关节（6 个自由度）
     """
 
     def __init__(
@@ -95,9 +110,12 @@ class RigidJoint(RBC):
     def get_anchor_pos(self):
         """
         Get the anchor position of the joint in the world frame.
+        获取关节在世界坐标系中的锚点位置。
 
         Mathematically, the anchor point corresponds to the point that is fixed wrt parent link and is coincident with
         the joint for the neutral configuration qpos0. This means that this point moves under the effect of the
+        数学上，锚点对应于相对于父连杆固定的点，在中性配置 qpos0 时与关节重合。
+        这意味着该点在父连杆运动的影响下移动。
         generalized coordinates corresponding to this joint (and all its ancestors in the kinematic tree). Physically,
         the anchor point is the "output" of the joint transmission, on which the child body is welded.
         """

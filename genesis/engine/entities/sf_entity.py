@@ -14,6 +14,13 @@ import trimesh
 class SFParticleEntity(ParticleEntity):
     """
     PBD-based entity represented solely by particles.
+    仅由粒子表示的基于 PBD 的实体。
+    
+    这是一个轻量级的粒子实体，主要用于可视化目的。
+    粒子不参与实际的物理计算，而是作为视觉表示。
+    适用于粒子效果、可视化标记等场景。
+    
+    注意：该实体的粒子纯粹用于可视化，不添加到求解器中。
     """
 
     def __init__(self, scene, solver, material, morph, surface, particle_size, idx, particle_start):
