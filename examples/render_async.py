@@ -1,4 +1,4 @@
-import os
+﻿import os
 import threading
 
 import genesis as gs
@@ -29,7 +29,11 @@ def main():
             run_in_thread=False,
         ),
         show_viewer=True,
-        show_FPS=True,
+        profiling_options=gs.options.ProfilingOptions(
+            show_FPS=True,
+        ),
+        # 下面被注释掉的是会产生警告的旧版本写法
+        # show_FPS=True,
     )
 
     ########################## entities ##########################

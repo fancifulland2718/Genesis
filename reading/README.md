@@ -1,4 +1,4 @@
-# Genesis Engine 架构分析文档
+﻿# Genesis Engine 架构分析文档
 
 本文件夹包含 Genesis 引擎的完整架构分析，包括求解器、耦合器以及其他核心模块的详细文档。
 

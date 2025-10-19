@@ -1,4 +1,4 @@
-import genesis as gs
+﻿import genesis as gs
 import gstaichi as ti
 from genesis.repr_base import RBC
 import numpy as np
@@ -7,24 +7,19 @@ import numpy as np
 @ti.data_oriented
 class AABB(RBC):
     """
-    AABB (Axis-Aligned Bounding Box) class for managing collections of bounding boxes in batches.
+    轴对齐包围盒（Axis-Aligned Bounding Box，AABB）批量管理类。
 
-    This class defines an axis-aligned bounding box (AABB) structure and provides a Taichi dataclass
-    for efficient computation and intersection testing on the GPU. Each AABB is represented by its
-    minimum and maximum 3D coordinates. The class supports batch processing of multiple AABBs.
+    用途
+    - 在 GPU 上以批量形式存储与计算一组 AABB（min/max 三维坐标）。
+    - 提供相交测试等基础操作（在 Taichi dataclass 内）。
 
-    Attributes:
-        n_batches (int): Number of batches of AABBs.
-        n_aabbs (int): Number of AABBs per batch.
-        ti_aabb (taichi.dataclass): Taichi dataclass representing an individual AABB with min and max vectors.
-        aabbs (taichi.field): Taichi field storing all AABBs in the specified batches.
+    参数
+    - n_batches: 批次数（环境数）
+    - n_aabbs: 每个批次中的 AABB 数量
 
-    Args:
-        n_batches (int): Number of batches to allocate.
-        n_aabbs (int): Number of AABBs per batch.
-
-    Example:
-        aabb_manager = AABB(n_batches=4, n_aabbs=128)
+    字段
+    - ti_aabb: Taichi dataclass，表示单个 AABB（含 `min` 与 `max` 向量）
+    - aabbs: Taichi field，形状为 (n_batches, n_aabbs)，存放所有 AABB
     """
 
     def __init__(self, n_batches, n_aabbs):
@@ -39,7 +34,8 @@ class AABB(RBC):
             @ti.func
             def intersects(self, other) -> bool:
                 """
-                Check if this AABB intersects with another AABB.
+                AABB 相交测试（闭区间判定）
+                返回 True 当且仅当两个 AABB 在三个坐标轴上均有重叠。
                 """
                 return (
                     self.min[0] <= other.max[0]
@@ -62,54 +58,25 @@ class AABB(RBC):
 @ti.data_oriented
 class LBVH(RBC):
     """
-    Linear BVH is a simple BVH that is used to accelerate collision detection. It supports parallel building and
-    querying of the BVH tree. Only supports axis-aligned bounding boxes (AABBs).
+    线性 BVH（LBVH）用于加速基于 AABB 的碰撞检测 / 交叉查询。
 
-    Attributes
-    -----
-        aabbs : ti.field
-        The input AABBs to be organized in the BVH, shape (n_batches, n_aabbs).
-        n_aabbs : int
-            Number of AABBs per batch.
-        n_batches : int
-            Number of batches.
-        max_query_results : int
-            Maximum number of query results allowed.
-        max_stack_depth : int
-            Maximum stack depth for BVH traversal.
-        aabb_centers : ti.field
-            Centers of the AABBs, shape (n_batches, n_aabbs).
-        aabb_min : ti.field
-            Minimum coordinates of AABB centers per batch, shape (n_batches).
-        aabb_max : ti.field
-            Maximum coordinates of AABB centers per batch, shape (n_batches).
-        scale : ti.field
-            Scaling factors for normalizing AABB centers, shape (n_batches).
-        morton_codes : ti.field
-            Morton codes for each AABB, shape (n_batches, n_aabbs).
-        hist : ti.field
-            Histogram for radix sort, shape (n_batches, 256).
-        prefix_sum : ti.field
-            Prefix sum for histogram, shape (n_batches, 256).
-        offset : ti.field
-            Offset for radix sort, shape (n_batches, n_aabbs).
-        tmp_morton_codes : ti.field
-            Temporary storage for radix sort, shape (n_batches, n_aabbs).
-        Node : ti.dataclass
-            Node structure for the BVH tree, containing left, right, parent indices and bounding box.
-        nodes : ti.field
-            BVH nodes, shape (n_batches, n_aabbs * 2 - 1).
-        internal_node_visited : ti.field
-            Flags indicating if an internal node has been visited during traversal, shape (n_batches, n_aabbs - 1).
-        query_result : ti.field
-            Query results as a vector of (batch id, self id, query id), shape (max_query_results).
-        query_result_count : ti.field
-            Counter for the number of query results.
+    管线概述
+    1) compute_aabb_centers_and_scales：计算每个 AABB 的中心与归一化尺度
+    2) compute_morton_codes：对中心点生成 MortonCode（Z-order，空间映射到一维）
+    3) radix_sort_morton_codes：按字节进行基数排序（Radix sort）
+    4) build_radix_tree：依据 MortonCode 构建层次树（Karras 2012）
+    5) compute_bounds：自下而上装配各节点（internal）的包围盒
 
-    Notes
-    ------
-        For algorithmic details, see:
-        https://research.nvidia.com/sites/default/files/pubs/2012-06_Maximizing-Parallelism-in/karras2012hpg_paper.pdf
+    字段说明
+    - aabbs: 输入的 AABB 数组，形状 (n_batches, n_aabbs)
+    - morton_codes: 对每个 AABB 生成的 Morton 编码与原索引（u32 vec2）
+    - nodes: BVH 节点数组（前 n_aabbs-1 为内部节点，后 n_aabbs 为叶子）
+    - internal_node_active / internal_node_ready: 自底向上装配 bound 的分层推进标记
+    - query_result / query_result_count: 查询返回的三元组 (batch_id, aabb_id, query_id) 与计数
+
+    参考
+    - Karras, T. "Maximizing Parallelism in the Construction of BVHs, Octrees, and k-d Trees." HPG 2012.
+      https://research.nvidia.com/sites/default/files/pubs/2012-06_Maximizing-Parallelism-in/karras2012hpg_paper.pdf
     """
 
     def __init__(self, aabb: AABB, max_n_query_result_per_aabb: int = 8, n_radix_sort_groups: int = 256):
@@ -121,25 +88,27 @@ class LBVH(RBC):
         self.n_aabbs = aabb.n_aabbs
         self.n_batches = aabb.n_batches
 
-        # Maximum number of query results
+        # 最大查询结果条数（上限避免溢出）
         self.max_query_results = min(self.n_aabbs * max_n_query_result_per_aabb * self.n_batches, 0x7FFFFFFF)
-        # Maximum stack depth for traversal
+        # 遍历栈最大深度（迭代 DFS）
         self.max_stack_depth = 64
         self.aabb_centers = ti.field(gs.ti_vec3, shape=(self.n_batches, self.n_aabbs))
         self.aabb_min = ti.field(gs.ti_vec3, shape=(self.n_batches))
         self.aabb_max = ti.field(gs.ti_vec3, shape=(self.n_batches))
         self.scale = ti.field(gs.ti_vec3, shape=(self.n_batches))
+        # morton_codes: vec2(u32) = [编码(高 32)、原索引(低 32)]
         self.morton_codes = ti.field(ti.types.vector(2, ti.u32), shape=(self.n_batches, self.n_aabbs))
 
-        # Histogram for radix sort
+        # 基数排序直方图（单组版本，256 桶 = 8 bit）
         self.hist = ti.field(ti.u32, shape=(self.n_batches, 256))
-        # Prefix sum for histogram
+        # 直方图前缀和（含一个 0 前缀）
         self.prefix_sum = ti.field(ti.u32, shape=(self.n_batches, 256 + 1))
-        # Offset for radix sort
+        # 每个元素在对应桶里的局部偏移
         self.offset = ti.field(ti.u32, shape=(self.n_batches, self.n_aabbs))
-        # Temporary storage for radix sort
+        # 临时存放排序结果
         self.tmp_morton_codes = ti.field(ti.types.vector(2, ti.u32), shape=(self.n_batches, self.n_aabbs))
 
+        # 分组基数排序（更大数据量时减少串行片段）
         self.n_radix_sort_groups = n_radix_sort_groups
         self.hist_group = ti.field(ti.u32, shape=(self.n_batches, self.n_radix_sort_groups, 256 + 1))
         self.prefix_sum_group = ti.field(ti.u32, shape=(self.n_batches, self.n_radix_sort_groups + 1, 256))
@@ -149,13 +118,10 @@ class LBVH(RBC):
         @ti.dataclass
         class Node:
             """
-            Node structure for the BVH tree.
-
-            Attributes:
-                left (int): Index of the left child node.
-                right (int): Index of the right child node.
-                parent (int): Index of the parent node.
-                bound (ti_aabb): Bounding box of the node, represented as an AABB.
+            BVH 节点结构
+            - left/right: 子节点索引（叶子为 -1/-1）
+            - parent: 父节点索引（根的 parent = -1）
+            - bound: 此节点的 AABB（内节点为子包围盒并集；叶子为原 AABB）
             """
 
             left: ti.i32
@@ -165,20 +131,25 @@ class LBVH(RBC):
 
         self.Node = Node
 
-        # Nodes of the BVH, first n_aabbs - 1 are internal nodes, last n_aabbs are leaf nodes
+        # 节点数组：前 n_aabbs-1 为内部节点，后 n_aabbs 为叶节点
         self.nodes = self.Node.field(shape=(self.n_batches, self.n_aabbs * 2 - 1))
-        # Whether an internal node has been visited during traversal
+        # 自底向上装配 bound 的层推进状态
         self.internal_node_active = ti.field(gs.ti_bool, shape=(self.n_batches, self.n_aabbs - 1))
         self.internal_node_ready = ti.field(gs.ti_bool, shape=(self.n_batches, self.n_aabbs - 1))
 
-        # Query results, vec3 of batch id, self id, query id
+        # 查询结果 (batch id, self id, query id)
         self.query_result = ti.field(gs.ti_ivec3, shape=(self.max_query_results))
-        # Count of query results
+        # 查询结果计数
         self.query_result_count = ti.field(ti.i32, shape=())
 
     def build(self):
         """
-        Build the BVH from the axis-aligned bounding boxes (AABBs).
+        构建 BVH（主流程）：
+        1) 计算中心与尺度
+        2) 生成 Morton 编码
+        3) 基数排序（按字节）
+        4) 基于 Morton 相邻关系构建树
+        5) 自底向上装配各节点的包围盒
         """
         self.compute_aabb_centers_and_scales()
         self.compute_morton_codes()
@@ -189,18 +160,21 @@ class LBVH(RBC):
     @ti.func
     def filter(self, i_a, i_q):
         """
-        Filter function that always returns False.
+        查询过滤器（默认不过滤，返回 False）。
 
-        This function does not filter out any AABB by default.
-        It can be overridden in subclasses to implement custom filtering logic.
-
-        i_a: index of the found AABB
-        i_q: index of the query AABB
+        可在子类中覆写以实现自定义过滤逻辑。
+        - i_a: 命中的 AABB 索引
+        - i_q: 查询的 AABB 索引
         """
         return False
 
     @ti.kernel
     def compute_aabb_centers_and_scales(self):
+        """
+        计算 AABB 中心与全局缩放（归一化到 [0,1]，避免坐标尺度差异影响 Morton 分布）。
+        - 先计算中心
+        - 用所有 AABB 的 min/max 计算尺度 scale = 1/max(范围, EPS)
+        """
         for i_b, i_a in ti.ndrange(self.n_batches, self.n_aabbs):
             self.aabb_centers[i_b, i_a] = (self.aabbs[i_b, i_a].min + self.aabbs[i_b, i_a].max) / 2
 
@@ -220,11 +194,9 @@ class LBVH(RBC):
     @ti.kernel
     def compute_morton_codes(self):
         """
-        Compute the Morton codes for each AABB.
-
-        The first 32 bits is the Morton code for the x, y, z coordinates, and the last 32 bits is the index of the AABB
-        in the original array. The x, y, z coordinates are scaled to a 10-bit integer range [0, 1024) and interleaved to
-        form the Morton code.
+        计算每个 AABB 的 Morton 编码（Z-order 曲线）。
+        - 将归一化中心映射到 10-bit（[0,1024)），分别展开为 30-bit（插零），再交织合并成 30-bit Morton code
+        - morton_codes 的第二个分量存放原始索引，便于稳定排序与回溯
         """
         for i_b, i_a in ti.ndrange(self.n_batches, self.n_aabbs):
             center = self.aabb_centers[i_b, i_a] - self.aabb_min[i_b]
@@ -241,13 +213,12 @@ class LBVH(RBC):
     @ti.func
     def expand_bits(self, v: ti.u32) -> ti.u32:
         """
-        Expands a 10-bit integer into 30 bits by inserting 2 zeros before each bit.
+        将 10-bit 展开为 30-bit：每个 bit 前插入两个 0（bit interleaving 前的预处理）。
+        实现基于掩码与移位的“位扩张”技巧（参考常见 Morton 编码实现）。
         """
         v = (v * ti.u32(0x00010001)) & ti.u32(0xFF0000FF)
-        # This is to silence taichi debug warning of overflow
-        # Has the same result as v = (v * ti.u32(0x00000101)) & ti.u32(0x0F00F00F)
-        # Performance difference is negligible
-        # See https://github.com/Genesis-Embodied-AI/Genesis/pull/1560 for details
+        # 为抑制 Taichi 的溢出警告，使用等效形式（性能差异可忽略）
+        # 原式：v = (v * ti.u32(0x00000101)) & ti.u32(0x0F00F00F)
         v = (v | ((v & 0x00FFFFFF) << 8)) & 0x0F00F00F
         v = (v * ti.u32(0x00000011)) & ti.u32(0xC30C30C3)
         v = (v * ti.u32(0x00000005)) & ti.u32(0x49249249)
@@ -255,9 +226,10 @@ class LBVH(RBC):
 
     def radix_sort_morton_codes(self):
         """
-        Radix sort the morton codes, using 8 bits at a time.
+        基数排序（高 32bit 的 MortonCode 以字节为单位进行 4 轮排序）。
+        说明：morton_codes 的低 32bit 为原索引，已天然稳定，无需排序。
         """
-        # The last 32 bits are the index of the AABB which are already sorted, no need to sort
+        # 仅处理 morton_code（vec2 的第 0 分量）；按字节从低到高进行 4 轮（i=4..7）
         for i in range(4, 8):
             if self.n_radix_sort_groups == 1:
                 self._kernel_radix_sort_morton_codes_one_round(i)
@@ -266,39 +238,37 @@ class LBVH(RBC):
 
     @ti.kernel
     def _kernel_radix_sort_morton_codes_one_round(self, i: int):
-        # Clear histogram
+        # 单组版本：对所有元素构建 256 桶直方图 → 前缀和 → 重新布置 → 交换临时缓冲
         self.hist.fill(0)
 
-        # Fill histogram
+        # 统计直方图（此处顺序遍历，若需更高并行度可考虑分组版）
         for i_b in range(self.n_batches):
-            # This is now sequential
-            # TODO Parallelize, need to use groups to handle data to remain stable, could be not worth it
             for i_a in range(self.n_aabbs):
                 code = (self.morton_codes[i_b, i_a][1 - (i // 4)] >> ((i % 4) * 8)) & 0xFF
                 self.offset[i_b, i_a] = ti.atomic_add(self.hist[i_b, ti.i32(code)], 1)
 
-        # Compute prefix sum
+        # 前缀和（顺序累加，256 桶）
         for i_b in ti.ndrange(self.n_batches):
             self.prefix_sum[i_b, 0] = 0
-            for j in range(1, 256):  # sequential prefix sum
+            for j in range(1, 256):
                 self.prefix_sum[i_b, j] = self.prefix_sum[i_b, j - 1] + self.hist[i_b, j - 1]
 
-        # Reorder morton codes
+        # 按桶与偏移重排到临时缓冲
         for i_b, i_a in ti.ndrange(self.n_batches, self.n_aabbs):
             code = ti.i32((self.morton_codes[i_b, i_a][1 - (i // 4)] >> ((i % 4) * 8)) & 0xFF)
             idx = ti.i32(self.offset[i_b, i_a] + self.prefix_sum[i_b, code])
             self.tmp_morton_codes[i_b, idx] = self.morton_codes[i_b, i_a]
 
-        # Swap the temporary and original morton codes
+        # 写回
         for i_b, i_a in ti.ndrange(self.n_batches, self.n_aabbs):
             self.morton_codes[i_b, i_a] = self.tmp_morton_codes[i_b, i_a]
 
     @ti.kernel
     def _kernel_radix_sort_morton_codes_one_round_group(self, i: int):
-        # Clear histogram
+        # 分组版本：每组独立构建直方图与局部前缀，随后用全局前缀定位写回索引
         self.hist_group.fill(0)
 
-        # Fill histogram
+        # 分组直方图与组内偏移
         for i_b, i_g in ti.ndrange(self.n_batches, self.n_radix_sort_groups):
             start = i_g * self.group_size
             end = ti.select(i_g == self.n_radix_sort_groups - 1, self.n_aabbs, (i_g + 1) * self.group_size)
@@ -307,57 +277,60 @@ class LBVH(RBC):
                 self.offset[i_b, i_a] = self.hist_group[i_b, i_g, code]
                 self.hist_group[i_b, i_g, code] = self.hist_group[i_b, i_g, code] + 1
 
-        # Compute prefix sum
+        # 组内/组间前缀和
         for i_b, i_c in ti.ndrange(self.n_batches, 256):
             self.prefix_sum_group[i_b, 0, i_c] = 0
-            for i_g in range(1, self.n_radix_sort_groups + 1):  # sequential prefix sum
+            for i_g in range(1, self.n_radix_sort_groups + 1):
                 self.prefix_sum_group[i_b, i_g, i_c] = (
                     self.prefix_sum_group[i_b, i_g - 1, i_c] + self.hist_group[i_b, i_g - 1, i_c]
                 )
         for i_b in range(self.n_batches):
             self.prefix_sum[i_b, 0] = 0
-            for i_c in range(1, 256 + 1):  # sequential prefix sum
+            for i_c in range(1, 256 + 1):
                 self.prefix_sum[i_b, i_c] = (
                     self.prefix_sum[i_b, i_c - 1] + self.prefix_sum_group[i_b, self.n_radix_sort_groups, i_c - 1]
                 )
 
-        # Reorder morton codes
+        # 重排写入临时缓冲（全局前缀 + 组内前缀 + 组内偏移）
         for i_b, i_a in ti.ndrange(self.n_batches, self.n_aabbs):
             code = ti.i32((self.morton_codes[i_b, i_a][1 - (i // 4)] >> ((i % 4) * 8)) & 0xFF)
             i_g = ti.min(i_a // self.group_size, self.n_radix_sort_groups - 1)
             idx = ti.i32(self.prefix_sum[i_b, code] + self.prefix_sum_group[i_b, i_g, code] + self.offset[i_b, i_a])
-            # Use the group prefix sum to find the correct index
             self.tmp_morton_codes[i_b, idx] = self.morton_codes[i_b, i_a]
 
-        # Swap the temporary and original morton codes
+        # 写回
         for i_b, i_a in ti.ndrange(self.n_batches, self.n_aabbs):
             self.morton_codes[i_b, i_a] = self.tmp_morton_codes[i_b, i_a]
 
     @ti.kernel
     def build_radix_tree(self):
         """
-        Build the radix tree from the sorted morton codes.
-
-        The tree is built in parallel for every internal node.
+        基于已排序的 MortonCode 构建 Radix 树（Karras 2012 算法）。
+        核心思路：
+        - 对每个内部节点 i，沿 Morton 排序序列找到其覆盖范围 [min,max] 与分裂点 gamma，
+          由此确定左右孩子（可能是内节点或叶节点）。
         """
-        # Initialize the first node
+        # 根节点 parent 设为 -1
         for i_b in ti.ndrange(self.n_batches):
             self.nodes[i_b, 0].parent = -1
 
-        # Initialize the leaf nodes
+        # 初始化叶节点（left/right = -1）
         for i_b, i in ti.ndrange(self.n_batches, self.n_aabbs):
             self.nodes[i_b, i + self.n_aabbs - 1].left = -1
             self.nodes[i_b, i + self.n_aabbs - 1].right = -1
 
-        # Parallel build for every internal node
+        # 并行构建内部节点（索引 0..n_aabbs-2）
         for i_b, i in ti.ndrange(self.n_batches, self.n_aabbs - 1):
+            # 方向 d：比较 i 与相邻两侧 LCP，选择增长更快的一侧
             d = ti.select(self.delta(i, i + 1, i_b) > self.delta(i, i - 1, i_b), 1, -1)
 
+            # 扩大范围以找到区间上界 l_max（指数扩张）
             delta_min = self.delta(i, i - d, i_b)
             l_max = ti.u32(2)
             while self.delta(i, i + ti.i32(l_max) * d, i_b) > delta_min:
                 l_max *= 2
 
+            # 二分查找精确的范围长度 l
             l = ti.u32(0)
             t = l_max // 2
             while t > 0:
@@ -365,8 +338,11 @@ class LBVH(RBC):
                     l += t
                 t //= 2
 
+            # 区间端点 j 与当前节点的 LCP
             j = i + ti.i32(l) * d
             delta_node = self.delta(i, j, i_b)
+
+            # 在 [i, j] 内再次二分找到分裂点 gamma（左/右子树分割）
             s = ti.u32(0)
             t = (l + 1) // 2
             while t > 0:
@@ -385,7 +361,9 @@ class LBVH(RBC):
     @ti.func
     def delta(self, i: ti.i32, j: ti.i32, i_b: ti.i32):
         """
-        Compute the longest common prefix (LCP) of the morton codes of two AABBs.
+        计算 morton_codes[i] 与 morton_codes[j] 的最长公共前缀长度（LCP，0..64）。
+        - morton_codes 存储为 vec2(u32)，依次比较高 32bit、低 32bit 直到发现首个不等 bit
+        - 若 j 越界，返回 -1 表示无效
         """
         result = -1
         if j >= 0 and j < self.n_aabbs:
@@ -402,9 +380,9 @@ class LBVH(RBC):
 
     def compute_bounds(self):
         """
-        Compute the bounds of the BVH nodes.
-
-        Starts from the leaf nodes and works upwards layer by layer.
+        自底向上装配每个 BVH 节点的 AABB：
+        - 先初始化叶子节点的 bound 并激活其父节点
+        - 之后一层层推进：当父节点的两个孩子都已具备 bound 时，合并得到父 bound，再激活更上一层
         """
         self._kernel_compute_bounds_init()
         is_done = False
@@ -413,9 +391,11 @@ class LBVH(RBC):
 
     @ti.kernel
     def _kernel_compute_bounds_init(self):
+        # 复位层推进标志
         self.internal_node_active.fill(False)
         self.internal_node_ready.fill(False)
 
+        # 用叶子（原 AABB）初始化底层 bound，并激活其父节点
         for i_b, i in ti.ndrange(self.n_batches, self.n_aabbs):
             idx = ti.i32(self.morton_codes[i_b, i][1])
             self.nodes[i_b, i + self.n_aabbs - 1].bound.min = self.aabbs[i_b, idx].min
@@ -426,6 +406,7 @@ class LBVH(RBC):
 
     @ti.kernel
     def _kernel_compute_bounds_one_layer(self) -> ti.i32:
+        # 对已激活的内部节点，合并左右孩子的 bound，标记其父为 ready
         for i_b, i in ti.ndrange(self.n_batches, self.n_aabbs - 1):
             if self.internal_node_active[i_b, i]:
                 left_bound = self.nodes[i_b, self.nodes[i_b, i].left].bound
@@ -437,6 +418,7 @@ class LBVH(RBC):
                     self.internal_node_ready[i_b, parent_idx] = True
                 self.internal_node_active[i_b, i] = False
 
+        # 将 ready 的节点激活到下一轮，若仍有激活则返回 False 继续循环
         is_done = True
         for i_b, i in ti.ndrange(self.n_batches, self.n_aabbs - 1):
             if self.internal_node_ready[i_b, i]:
@@ -449,37 +431,41 @@ class LBVH(RBC):
     @ti.func
     def query(self, aabbs: ti.template()):
         """
-        Query the BVH for intersections with the given AABBs.
+        遍历查询：给定一组查询 AABB，返回与 BVH 命中的 (batch, aabb_id, query_id)。
 
-        The results are stored in the query_result field.
+        流程（每个 batch、每个查询 AABB）：
+        - 使用手动栈进行 DFS 遍历（max_stack_depth）
+        - 内节点：若相交则将左右子压栈
+        - 叶节点：若不过滤（filter 返回 False），写入查询结果
+        - 若结果超过 max_query_results，置 overflow 标志（仍继续统计但不写）
         """
         self.query_result_count[None] = 0
         overflow = False
 
         n_querys = aabbs.shape[1]
         for i_b, i_q in ti.ndrange(self.n_batches, n_querys):
-            query_stack = ti.Vector.zero(ti.i32, 64)
+            query_stack = ti.Vector.zero(ti.i32, 64)  # 栈容量与 max_stack_depth 一致
             stack_depth = 1
 
             while stack_depth > 0:
                 stack_depth -= 1
                 node_idx = query_stack[stack_depth]
                 node = self.nodes[i_b, node_idx]
-                # Check if the AABB intersects with the node's bounding box
+                # 相交测试
                 if aabbs[i_b, i_q].intersects(node.bound):
-                    # If it's a leaf node, add the AABB index to the query results
                     if node.left == -1 and node.right == -1:
+                        # 叶子节点：由节点索引反查原 AABB 索引
                         i_a = ti.i32(self.morton_codes[i_b, node_idx - (self.n_aabbs - 1)][1])
-                        # Check if the filter condition is met
+                        # 过滤（用于剔除自碰撞/同组等）
                         if self.filter(i_a, i_q):
                             continue
                         idx = ti.atomic_add(self.query_result_count[None], 1)
                         if idx < self.max_query_results:
-                            self.query_result[idx] = gs.ti_ivec3(i_b, i_a, i_q)  # Store the AABB index
+                            self.query_result[idx] = gs.ti_ivec3(i_b, i_a, i_q)
                         else:
                             overflow = True
                     else:
-                        # Push children onto the stack
+                        # 内节点：将子节点入栈（右后左先，或相反，均可）
                         if node.right != -1:
                             query_stack[stack_depth] = node.right
                             stack_depth += 1
@@ -493,9 +479,9 @@ class LBVH(RBC):
 @ti.data_oriented
 class FEMSurfaceTetLBVH(LBVH):
     """
-    FEMSurfaceTetLBVH is a specialized Linear BVH for FEM surface tetrahedrals.
-
-    It extends the LBVH class to support filtering based on FEM surface tetrahedral elements.
+    针对 FEM 表面四面体的 LBVH（带过滤规则）。
+    过滤逻辑：
+    - 剔除与查询四面体共享任一顶点的候选四面体（避免自碰撞）
     """
 
     def __init__(self, fem_solver, aabb: AABB, max_n_query_result_per_aabb: int = 8, n_radix_sort_groups: int = 256):
@@ -505,16 +491,8 @@ class FEMSurfaceTetLBVH(LBVH):
     @ti.func
     def filter(self, i_a, i_q):
         """
-        Filter function for FEM surface tets. Filter out tet that share vertices.
-
-        This is used to avoid self-collisions in FEM surface tets.
-
-        Parameters
-        ----------
-        i_a:
-            index of the found AABB
-        i_q:
-            index of the query AABB
+        过滤条件：
+        - 若 i_a >= i_q，或两者四面体共享任一顶点，则返回 True（表示“过滤掉”）
         """
         result = i_a >= i_q
         i_av = self.fem_solver.elements_i[self.fem_solver.surface_elements[i_a]].el2v
@@ -528,8 +506,9 @@ class FEMSurfaceTetLBVH(LBVH):
 @ti.data_oriented
 class RigidTetLBVH(LBVH):
     """
-    RigidTetLBVH is a specialized Linear BVH for rigid tetrahedrals.
-    It extends the LBVH class to support filtering based on rigid tetrahedral elements.
+    针对刚体四面体的 LBVH（带过滤规则）。
+    过滤逻辑：
+    - 使用 rigid 求解器的碰撞对有效性表，剔除同 link 或不允许的碰撞对。
     """
 
     def __init__(self, coupler, aabb: AABB, max_n_query_result_per_aabb: int = 8, n_radix_sort_groups: int = 256):
@@ -540,10 +519,8 @@ class RigidTetLBVH(LBVH):
     @ti.func
     def filter(self, i_a, i_q):
         """
-        Filter function for Rigid tets. Filter out tet that belong to the same link
-
-        i_a: index of the found AABB
-        i_q: index of the query AABB
+        过滤条件：
+        - 查 rigid_solver.collider._collider_info.collision_pair_validity，若为 False 则过滤
         """
         i_ag = self.coupler.rigid_volume_elems_geom_idx[i_a]
         i_qg = self.coupler.rigid_volume_elems_geom_idx[i_q]

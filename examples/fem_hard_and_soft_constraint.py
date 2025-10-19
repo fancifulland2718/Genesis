@@ -1,4 +1,4 @@
-import os
+﻿import os
 import argparse
 
 import numpy as np
@@ -45,7 +45,8 @@ def main():
         profiling_options=gs.options.ProfilingOptions(
             show_FPS=False,
         ),
-        show_viewer=args.vis,
+        show_viewer=True,
+        # show_viewer=args.vis,
     )
 
     scene.add_entity(gs.morphs.Plane())

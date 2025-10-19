@@ -1,3 +1,18 @@
+﻿"""
+PBD 求解器（Position-Based Dynamics）
+
+概述
+- 面向布料/弹性体/液体/自由粒子的统一 PBD 求解器，支持多环境 batch。
+- 时间步管线（子步）
+  1) 预测阶段：存初始位置 + 外力积分预测位置
+  2) 拓扑约束：拉伸/弯曲/体积（无邻域查找）
+  3) 空间哈希：重排粒子以加速邻域查询
+  4) 空间约束：密度（不可压缩）/粘度（XSPH）
+  5) 粒子间碰撞：分离 + 静/动摩擦
+  6) 速度更新：v = (x - x0) / dt
+  7) 后处理：从重排数组回写 + 边界碰撞
+"""
+
 import math
 
 import numpy as np
@@ -27,12 +42,22 @@ class PBDSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     class MATERIAL(gs.IntEnum):
+        """
+        材料类型枚举：用于决定参与何种约束/碰撞逻辑
+        - CLOTH: 布料（2D 拓扑，拉伸/弯曲）
+        - ELASTIC: 弹性体（3D 拓扑，体积约束）
+        - LIQUID: 液体（PBF，密度/粘度约束）
+        - PARTICLE: 自由粒子（仅外力与边界，忽略内部约束/碰撞）
+        """
         CLOTH = 0
         ELASTIC = 1
         LIQUID = 2
         PARTICLE = 3  # non-physics particles
 
     def __init__(self, scene, sim, options):
+        """
+        读取选项并初始化求解器：边界、粒子尺寸、各类约束的迭代次数与参数、空间哈希等。
+        """
         super().__init__(scene, sim, options)
 
         # options
@@ -47,32 +72,32 @@ class PBDSolver(Solver):
 
         self._n_vvert_supports = self.scene.vis_options.n_support_neighbors
 
-        # -Neighbours_Setting-
-        self.dist_scale = self.particle_radius / 0.4  # @Zhenjia: double check this
+        # 邻域核函数尺度（与半径相关），用于 SPH 风格核函数
+        self.dist_scale = self.particle_radius / 0.4  # @Zhenjia: 有待确认比例
         self.h = 1.0
         self.h_2 = self.h**2
         self.h_6 = self.h**6
         self.h_9 = self.h**9
 
-        # -POLY6_KERNEL-
+        # Poly6 核
         self.poly6_Coe = 315.0 / (64 * math.pi)
 
-        # -SPIKY_KERNEL-
+        # Spiky 核（梯度）
         self.spiky_Coe = -45.0 / math.pi
 
-        # -LAMBDAS-
+        # λ 的数值稳定项（PBF/XPBD）
         self.lambda_epsilon = 100.0
 
-        # -S_CORR-
+        # 密度约束中的 S_Corr（表面张力修正）
         self.S_Corr_delta_q = 0.3
         self.S_Corr_k = 0.0001
 
-        # -Gradient Approx. delta difference-
+        # 梯度近似差分步长（曾用于涡量，当前注释）
         self.g_del = 0.01
 
         self.vorti_epsilon = 0.01
 
-        # spatial hasher
+        # 空间哈希：用于邻域搜索和粒子重排，提高局部遍历效率
         self.sh = SpatialHasher(
             cell_size=options.hash_grid_cell_size,
             grid_res=options._hash_grid_res,
@@ -82,6 +107,10 @@ class PBDSolver(Solver):
         self.setup_boundary()
 
     def _batch_shape(self, shape=None, first_dim=False, B=None):
+        """
+        工具：返回带 batch 维度的 shape
+        - first_dim=True 时将 batch 放前
+        """
         if B is None:
             B = self._B
 
@@ -93,12 +122,19 @@ class PBDSolver(Solver):
             return (B, shape) if first_dim else (shape, B)
 
     def setup_boundary(self):
+        """
+        设置立方体边界，用于边界碰撞与位置/速度修正。
+        """
         self.boundary = CubeBoundary(
             lower=self._lower_bound,
             upper=self._upper_bound,
         )
 
     def init_vvert_fields(self):
+        """
+        初始化可视化顶点数据（vverts）：
+        - 每个可视化顶点由若干物理粒子加权组合，用于稠密渲染。
+        """
         struct_vvert_info = ti.types.struct(
             support_idxs=ti.types.vector(self._n_vvert_supports, gs.ti_int),
             support_weights=ti.types.vector(self._n_vvert_supports, gs.ti_float),
@@ -114,6 +150,12 @@ class PBDSolver(Solver):
         )
 
     def init_particle_fields(self):
+        """
+        初始化粒子场：
+        - info: 静态参数（质量、静止位置、材料/摩擦、液体参数等）
+        - 动态状态：自由标志/位置/速度/增量/密度/λ 等
+        - 渲染用状态与重排版本（加速邻居访问）
+        """
         # particles information (static)
         struct_particle_info = ti.types.struct(
             mass=gs.ti_float,
@@ -128,11 +170,11 @@ class PBDSolver(Solver):
         )
         # particles state (dynamic)
         struct_particle_state = ti.types.struct(
-            free=gs.ti_bool,  # if not free, the particle is not affected by internal forces and solely controlled by external user until released
-            pos=gs.ti_vec3,  # position
-            ipos=gs.ti_vec3,  # initial position
-            dpos=gs.ti_vec3,  # delta position
-            vel=gs.ti_vec3,  # velocity
+            free=gs.ti_bool,  # 若非 free，粒子不受内部约束，仅受外部控制
+            pos=gs.ti_vec3,  # 当前位置
+            ipos=gs.ti_vec3,  # 子步初始位置（预测/修正参考）
+            dpos=gs.ti_vec3,  # 位置增量（约束/碰撞修正累计）
+            vel=gs.ti_vec3,  # 速度
             lam=gs.ti_float,
             rho=gs.ti_float,
         )
@@ -165,6 +207,11 @@ class PBDSolver(Solver):
         self.particles_render = struct_particle_state_render.field(shape=batched_shape, layout=ti.Layout.SOA)
 
     def init_edge_fields(self):
+        """
+        初始化边数据：
+        - edges_info：用于拉伸约束（边长保持）
+        - inner_edges_info：用于弯曲约束（二面角）
+        """
         # edges information for stretch. edge: (v1, v2)
         struct_edge_info = ti.types.struct(
             len_rest=gs.ti_float,
@@ -188,6 +235,9 @@ class PBDSolver(Solver):
         self.inner_edges_info = struct_inner_edge_info.field(shape=max(1, self._n_inner_edges), layout=ti.Layout.SOA)
 
     def init_elem_fields(self):
+        """
+        初始化体单元数据（四面体）：用于体积约束（保持体积接近静止体积）。
+        """
         struct_elem_info = ti.types.struct(
             vol_rest=gs.ti_float,
             volume_compliance=gs.ti_float,
@@ -200,12 +250,17 @@ class PBDSolver(Solver):
         self.elems_info = struct_elem_info.field(shape=max(1, self._n_elems), layout=ti.Layout.SOA)
 
     def init_ckpt(self):
+        "初始化检查点容器。"
         self._ckpt = dict()
 
     def reset_grad(self):
+        "当前求解器未接入自动微分，空实现。"
         pass
 
     def build(self):
+        """
+        构建：分配与计数相关的 field，构建空间哈希，并将实体加入求解器。
+        """
         super().build()
         self._B = self._sim._B
         self._n_particles = self.n_particles
@@ -234,6 +289,9 @@ class PBDSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     def add_entity(self, idx, material, morph, surface):
+        """
+        添加实体：根据材料类型构造对应的 PBD 实体，并记录其在全局数组的起始下标。
+        """
         if isinstance(material, gs.materials.PBD.Cloth):
             entity = PBD2DEntity(
                 scene=self.scene,
@@ -298,6 +356,7 @@ class PBDSolver(Solver):
         return entity
 
     def is_active(self):
+        "是否有粒子参与仿真。"
         return self._n_particles > 0
 
     # ------------------------------------------------------------------------------------
@@ -306,7 +365,10 @@ class PBDSolver(Solver):
 
     @ti.func
     def poly6(self, dist):
-        # dist is a VECTOR
+        """
+        Poly6 核（向量版本）：W(r) = 315/(64πh^9) * (h^2 - |r|^2)^3, 0 < |r| < h
+        用途：密度/粘度计算
+        """
         result = gs.ti_float(0.0)
         d = dist.norm() / self.dist_scale
         if 0 < d < self.h:
@@ -316,7 +378,7 @@ class PBDSolver(Solver):
 
     @ti.func
     def poly6_scalar(self, dist):
-        # dist is a SCALAR
+        "Poly6 核（标量版本）。"
         result = gs.ti_float(0.0)
         d = dist
         if 0 < d < self.h:
@@ -326,7 +388,10 @@ class PBDSolver(Solver):
 
     @ti.func
     def spiky(self, dist):
-        # dist is a VECTOR
+        """
+        Spiky 核的梯度项（返回向量）：∇W(r) = -45/(πh^6)*(h-|r|)^2/|r| * r_hat, 0<|r|<h
+        用途：PBF 中 ∇C、涡量等。
+        """
         result = ti.Vector.zero(gs.ti_float, 3)
         d = dist.norm() / self.dist_scale
         if 0 < d < self.h:
@@ -336,6 +401,10 @@ class PBDSolver(Solver):
 
     @ti.func
     def S_Corr(self, dist):
+        """
+        PBF 中的表面张力修正：s_corr = -k * (W(r)/W(δq))^4
+        缓解粒子聚集造成的数值伪振荡。
+        """
         upper = self.poly6(dist)
         lower = self.poly6_scalar(self.S_Corr_delta_q)
         m = upper / lower
@@ -346,11 +415,17 @@ class PBDSolver(Solver):
     # ------------------------------------------------------------------------------------
     @ti.kernel
     def _kernel_store_initial_pos(self, f: ti.i32):
+        "存储子步初始位置 ipos ← pos，供后续速度计算与碰撞使用。"
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             self.particles[i_p, i_b].ipos = self.particles[i_p, i_b].pos
 
     @ti.kernel
     def _kernel_reorder_particles(self, f: ti.i32):
+        """
+        重排粒子：
+        - 使用空间哈希为每个粒子计算 slot 索引并得到重排下标
+        - 将状态/静态信息按重排次序拷贝到 reordered 缓冲，提高邻域遍历局部性
+        """
         self.sh.compute_reordered_idx(
             self._n_particles, self.particles.pos, self.particles_ng.active, self.particles_ng.reordered_idx
         )
@@ -367,6 +442,11 @@ class PBDSolver(Solver):
 
     @ti.kernel
     def _kernel_apply_external_force(self, f: ti.i32, t: ti.f32):
+        """
+        外力与预测：
+        - 对自由粒子应用重力与外部力场（可选空气阻力）
+        - 位置预测：pos += vel * dt
+        """
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             if self.particles[i_p, i_b].free:
                 # gravity
@@ -379,6 +459,7 @@ class PBDSolver(Solver):
                 self.particles[i_p, i_b].vel = self.particles[i_p, i_b].vel + acc * self._substep_dt
 
                 if self.particles_info[i_p].material_type == self.MATERIAL.CLOTH:
+                    # 简单空气阻力：与速度幅值与方向相关
                     f_air_resistance = (
                         self.particles_info[i_p].air_resistance
                         * self.particles[i_p, i_b].vel.norm()
@@ -389,13 +470,19 @@ class PBDSolver(Solver):
                         - f_air_resistance / self.particles_info[i_p].mass * self._substep_dt
                     )
 
-            # attached particles are not free but still need to update position to follow the link
+            # 即便不是 free（被外部控制），也需要更新位置以跟随外部约束
             self.particles[i_p, i_b].pos = (
                 self.particles[i_p, i_b].pos + self.particles[i_p, i_b].vel * self._substep_dt
             )
 
     @ti.kernel
     def _kernel_solve_stretch(self, f: ti.i32):
+        """
+        拉伸约束（边长保持，XPBD）：
+        - 约束: C = |p1 - p2| - L0
+        - 修正: dp = -C / (w1 + w2 + α) * n * relaxation
+        - 迭代 self._max_stretch_solver_iterations 次
+        """
         for _ in ti.static(range(self._max_stretch_solver_iterations)):
             for i_e, i_b in ti.ndrange(self._n_edges, self._B):
                 v1 = self.edges_info[i_e].v1
@@ -410,6 +497,7 @@ class PBDSolver(Solver):
                 self.particles[v1, i_b].dpos += dp * w1
                 self.particles[v2, i_b].dpos -= dp * w2
 
+            # 应用累计修正并清零 dpos
             for i_p, i_b in ti.ndrange(self._n_particles, self._B):
                 if self.particles[i_p, i_b].free and self.particles_info[i_p].material_type != self.MATERIAL.PARTICLE:
                     self.particles[i_p, i_b].pos = self.particles[i_p, i_b].pos + self.particles[i_p, i_b].dpos
@@ -417,6 +505,11 @@ class PBDSolver(Solver):
 
     @ti.kernel
     def _kernel_solve_bending(self, f: ti.i32):
+        """
+        弯曲约束（二面角，XPBD）：
+        - 基于 Position Based Dynamics 附录 A（Bending Constraint Projection）
+        - 通过四点（共用边的两个三角形）计算法向并构造约束
+        """
         for _ in ti.static(range(self._max_bending_solver_iterations)):
             for i_ie, i_b in ti.ndrange(self._n_inner_edges, self._B):  # 140 - 142
                 v1 = self.inner_edges_info[i_ie].v1
@@ -470,6 +563,11 @@ class PBDSolver(Solver):
 
     @ti.kernel
     def _kernel_solve_volume(self, f: ti.i32):
+        """
+        体积约束（四面体，XPBD）：
+        - C = vol - vol_rest，vol = det(...) / 6
+        - 梯度为每个顶点对应的面法向/6
+        """
         for _ in ti.static(range(self._max_volume_solver_iterations)):
             for i_el, i_b in ti.ndrange(self._n_elems, self._B):
                 v1 = self.elems_info[i_el].v1
@@ -510,8 +608,11 @@ class PBDSolver(Solver):
 
     @ti.func
     def _func_solve_collision(self, i, j, i_b):
-        """j -> i"""
-
+        """
+        处理粒子 i 与 j 的碰撞（j -> i）：
+        - 当 curr_dist < target_dist 且 rest_dist > target_dist 时，进行分离
+        - 分离量按质量-可动权重分配，附加静/动摩擦修正
+        """
         cur_dist = (self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos).norm(gs.EPS)
         rest_dist = (
             self.particles_info_reordered[i, i_b].pos_rest - self.particles_info_reordered[j, i_b].pos_rest
@@ -522,11 +623,10 @@ class PBDSolver(Solver):
             wj = self.particles_reordered[j, i_b].free / self.particles_info_reordered[j, i_b].mass
             n = (self.particles_reordered[i, i_b].pos - self.particles_reordered[j, i_b].pos) / cur_dist
 
-            ### resolve collision ###
+            # 分离碰撞
             self.particles_reordered[i, i_b].dpos += wi / (wi + wj) * (target_dist - cur_dist) * n
 
-            ### apply friction ###
-            # https://mmacklin.com/uppfrta_preprint.pdf
+            # 摩擦（参见 Macklin, "Unified Particle Physics" 弹性-摩擦模型）
             # equation (23)
             dv = (self.particles_reordered[i, i_b].pos - self.particles_reordered[i, i_b].ipos) - (
                 self.particles_reordered[j, i_b].pos - self.particles_reordered[j, i_b].ipos
@@ -545,6 +645,12 @@ class PBDSolver(Solver):
 
     @ti.kernel
     def _kernel_solve_collision(self, f: ti.i32):
+        """
+        粒子间碰撞：
+        - 使用空间哈希在 3x3x3 邻域中遍历候选对
+        - 对至少一方为 free 且非液-液 的粒子对进行碰撞处理
+        - 应用累计位移增量并清零
+        """
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             if self.particles_info_reordered[i_p, i_b].material_type != self.MATERIAL.PARTICLE:
                 base = self.sh.pos_to_grid(self.particles_reordered[i_p, i_b].pos)
@@ -576,6 +682,10 @@ class PBDSolver(Solver):
 
     @ti.kernel
     def _kernel_solve_boundary_collision(self, f: ti.i32):
+        """
+        边界碰撞：对所有粒子施加边界条件（无论是否 free）。
+        - 使用边界对象的 impose_pos_vel 进行位置/速度修正
+        """
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             # boundary is enforced regardless of whether free
             pos_new, vel_new = self.boundary.impose_pos_vel(self.particles[i_p, i_b].pos, self.particles[i_p, i_b].vel)
@@ -584,6 +694,12 @@ class PBDSolver(Solver):
 
     @ti.kernel
     def _kernel_solve_density(self, f: ti.i32):
+        """
+        密度约束（PBF, Position-Based Fluids）：
+        - 迭代两阶段：
+          1) 计算 λ：λ_i = -C_i / (∑|∇C_i|^2 + ε)，C_i = ρ_i/ρ0 - 1
+          2) 计算位置修正：Δp_i = (1/ρ0)∑_j (λ_i+λ_j+s_corr)∇W(r_ij) * density_relaxation
+        """
         for _ in ti.static(range(self._max_density_solver_iterations)):
             # ---Calculate lambdas---
             for i_p, i_b in ti.ndrange(self._n_particles, self._B):
@@ -600,9 +716,9 @@ class PBDSolver(Solver):
                             self.sh.slot_size[slot_idx, i_b] + self.sh.slot_start[slot_idx, i_b],
                         ):
                             pos_j = self.particles_reordered[j, i_b].pos
-                            # ---Poly6---
+                            # ---Poly6--- 密度累加
                             rho += self.poly6(pos_i - pos_j) * self.particles_info_reordered[j, i_b].mass
-                            # ---Spiky---
+                            # ---Spiky--- 梯度项累加
                             s = self.spiky(pos_i - pos_j) / self.particles_info_reordered[i_p, i_b].rho_rest
                             spiky_i += s
                             lower_sum += s.dot(s)
@@ -623,7 +739,7 @@ class PBDSolver(Solver):
                         ):
                             if i_p != j:
                                 pos_j = self.particles_reordered[j, i_b].pos
-                                # ---S_Corr---
+                                # ---S_Corr--- 表面张力修正
                                 scorr = self.S_Corr(pos_i - pos_j)
                                 left = (
                                     self.particles_reordered[i_p, i_b].lam
@@ -652,6 +768,12 @@ class PBDSolver(Solver):
 
     @ti.kernel
     def _kernel_solve_viscosity(self, f: ti.i32):
+        """
+        粘度（XSPH 形式）：
+        - Δp_i = ∑_j W(r_ij) * v_ij * viscosity_relaxation
+        - 使相邻粒子速度更一致，平滑速度场
+        - 注：曾加入涡量与数值梯度近似，已注释
+        """
         for _ in ti.static(range(self._max_viscosity_solver_iterations)):
             for i_p, i_b in ti.ndrange(self._n_particles, self._B):
                 if self.particles_info_reordered[i_p, i_b].material_type == self.MATERIAL.LIQUID:
@@ -682,29 +804,20 @@ class PBDSolver(Solver):
                             )
 
                             dist = pos_i - pos_j
-                            # ---Vorticity---
+                            # ---Vorticity---（保留计算通路，但未生效）
                             omega_sum += v_ij.cross(self.spiky(dist))
-                            # -Gradient Approx.-
+                            # -Gradient Approx.- 数值梯度近似（已不启用）
                             dx_sum += v_ij.cross(self.spiky(dist + dx))
                             dy_sum += v_ij.cross(self.spiky(dist + dy))
                             dz_sum += v_ij.cross(self.spiky(dist + dz))
                             n_dx_sum += v_ij.cross(self.spiky(dist - dx))
                             n_dy_sum += v_ij.cross(self.spiky(dist - dy))
                             n_dz_sum += v_ij.cross(self.spiky(dist - dz))
-                            # ---Viscosity---
+                            # ---Viscosity--- XSPH
                             poly = self.poly6(dist)
                             xsph_sum += poly * v_ij
 
-                    # # ---Vorticity---
-                    # n_x = (dx_sum.norm() - n_dx_sum.norm()) / (2 * self.g_del)
-                    # n_y = (dy_sum.norm() - n_dy_sum.norm()) / (2 * self.g_del)
-                    # n_z = (dz_sum.norm() - n_dz_sum.norm()) / (2 * self.g_del)
-                    # n = ti.Vector([n_x, n_y, n_z])
-                    # big_n = n.normalized()
-                    # if not omega_sum.norm() == 0.0:
-                    #     vorticity[p] = vorti_epsilon * big_n.cross(omega_sum)
-
-                    # ---Viscosity---
+                    # 位置增量用于平滑速度差
                     self.particles_reordered[i_p, i_b].dpos = (
                         self.particles_reordered[i_p, i_b].dpos
                         + xsph_sum * self.particles_info_reordered[i_p, i_b].viscosity_relaxation
@@ -722,6 +835,7 @@ class PBDSolver(Solver):
 
     @ti.kernel
     def _kernel_compute_velocity(self, f: ti.i32):
+        "速度更新：v = (pos - ipos) / dt，用约束后位置反推有效速度。"
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             self.particles_reordered[i_p, i_b].vel = (
                 self.particles_reordered[i_p, i_b].pos - self.particles_reordered[i_p, i_b].ipos
@@ -729,6 +843,7 @@ class PBDSolver(Solver):
 
     @ti.kernel
     def _kernel_copy_from_reordered(self, f: ti.i32):
+        "将重排数组的结果拷贝回原粒子数组。"
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             if self.particles_ng[i_p, i_b].active:
                 reordered_idx = self.particles_ng[i_p, i_b].reordered_idx
@@ -739,13 +854,24 @@ class PBDSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     def process_input(self, in_backward=False):
+        "转发实体输入处理（前向）。"
         for entity in self._entities:
             entity.process_input(in_backward=in_backward)
 
     def process_input_grad(self):
+        "梯度流程暂未接入。"
         pass
 
     def substep_pre_coupling(self, f):
+        """
+        子步（耦合前）主管线：
+        1) 存初始位置 + 外力预测
+        2) 拓扑约束：拉伸/弯曲/体积（可选）
+        3) 空间哈希重排
+        4) 空间约束：密度/粘度（液体）
+        5) 粒子间碰撞
+        6) 速度更新（从位置差分）
+        """
         if self.is_active():
             self._kernel_store_initial_pos(f)
             self._kernel_apply_external_force(f, self._sim.cur_t)
@@ -774,9 +900,15 @@ class PBDSolver(Solver):
             self._kernel_compute_velocity(f)
 
     def substep_pre_coupling_grad(self, f):
+        "梯度流程暂未接入。"
         pass
 
     def substep_post_coupling(self, f):
+        """
+        子步（耦合后）：
+        1) 从重排数组回写（便于外部模块访问）
+        2) 边界碰撞（统一修正）
+        """
         if self.is_active():
             self._kernel_copy_from_reordered(f)
 
@@ -784,6 +916,7 @@ class PBDSolver(Solver):
             self._kernel_solve_boundary_collision(f)
 
     def substep_post_coupling_grad(self, f):
+        "梯度流程暂未接入。"
         pass
 
     # ------------------------------------------------------------------------------------
@@ -791,9 +924,11 @@ class PBDSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     def collect_output_grads(self):
+        "未集成梯度回传。"
         pass
 
     def add_grad_from_state(self, state):
+        "未集成梯度回传。"
         pass
 
     # ------------------------------------------------------------------------------------
@@ -801,12 +936,15 @@ class PBDSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     def save_ckpt(self, ckpt_name):
+        "检查点（未实现）。"
         pass
 
     def load_ckpt(self, ckpt_name):
+        "检查点恢复（未实现）。"
         pass
 
     def set_state(self, f, state, envs_idx=None):
+        "设置当前帧的粒子状态（位置/速度/free）。"
         if self.is_active():
             self._kernel_set_state(f, state.pos, state.vel, state.free)
 
@@ -818,6 +956,7 @@ class PBDSolver(Solver):
         vel: ti.types.ndarray(),  # shape [B, _n_particles, 3]
         free: ti.types.ndarray(),  # shape [B, _n_particles]
     ):
+        "将外部传入的 pos/vel/free 写入到粒子场。"
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             for j in ti.static(range(3)):
                 self.particles[i_p, i_b].pos[j] = pos[i_b, i_p, j]
@@ -825,6 +964,7 @@ class PBDSolver(Solver):
             self.particles[i_p, i_b].free = free[i_b, i_p]
 
     def get_state(self, f):
+        "导出当前帧的状态为 PBDSolverState。"
         if self.is_active():
             state = PBDSolverState(self.scene)
             self._kernel_get_state(f, state.pos, state.vel, state.free)
@@ -840,6 +980,7 @@ class PBDSolver(Solver):
         vel: ti.types.ndarray(),  # shape [B, _n_particles, 3]
         free: ti.types.ndarray(),  # shape [B, _n_particles]
     ):
+        "读取粒子 pos/vel/free 到外部数组。"
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             for j in ti.static(range(3)):
                 pos[i_b, i_p, j] = self.particles[i_p, i_b].pos[j]
@@ -847,10 +988,12 @@ class PBDSolver(Solver):
             free[i_b, i_p] = ti.cast(self.particles[i_p, i_b].free, gs.ti_bool)
 
     def update_render_fields(self):
+        "更新渲染缓冲：将粒子与可视化顶点写入渲染结构。"
         self._kernel_update_render_fields(self.sim.cur_substep_local)
 
     @ti.kernel
     def _kernel_update_render_fields(self, f: ti.i32):
+        "渲染字段更新：粒子可见性与可视化顶点加权位置。"
         for i_p, i_b in ti.ndrange(self._n_particles, self._B):
             if self.particles_ng[i_p, i_b].active:
                 self.particles_render[i_p, i_b].pos = self.particles[i_p, i_b].pos
@@ -878,6 +1021,7 @@ class PBDSolver(Solver):
         envs_idx: ti.types.ndarray(),
         poss: ti.types.ndarray(),
     ):
+        "批量设置部分粒子的位置，并清零其速度。"
         for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
             i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
@@ -893,6 +1037,7 @@ class PBDSolver(Solver):
         envs_idx: ti.types.ndarray(),
         poss: ti.types.ndarray(),
     ):
+        "批量读取部分粒子的位置。"
         for i_p_, i_b_ in ti.ndrange(n_particles, envs_idx.shape[0]):
             i_p = i_p_ + particle_start
             i_b = envs_idx[i_b_]
@@ -906,6 +1051,7 @@ class PBDSolver(Solver):
         envs_idx: ti.types.ndarray(),
         vels: ti.types.ndarray(),
     ):
+        "批量设置部分粒子的速度。"
         for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
             i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
@@ -920,6 +1066,10 @@ class PBDSolver(Solver):
         links_state: LinksState,
         envs_idx: NDArray[np.int32] | None = None,
     ) -> None:
+        """
+        将一组粒子绑定到某个刚体 link，用于动画/驱动。
+        - 内部通过耦合器 kernel_attach_pbd_to_rigid_link 实现
+        """
         envs_idx = self._scene._sanitize_envs_idx(envs_idx)
         self._sim._coupler.kernel_attach_pbd_to_rigid_link(particles_idx, envs_idx, link_idx, links_state)
 
@@ -931,6 +1081,7 @@ class PBDSolver(Solver):
         envs_idx: ti.types.ndarray(),
         vels: ti.types.ndarray(),
     ):
+        "批量读取部分粒子的速度。"
         for i_p_, i_b_ in ti.ndrange(n_particles, envs_idx.shape[0]):
             i_p = i_p_ + particle_start
             i_b = envs_idx[i_b_]
@@ -944,6 +1095,7 @@ class PBDSolver(Solver):
         envs_idx: ti.types.ndarray(),
         actives: ti.types.ndarray(),  # shape [B, n_particles]
     ):
+        "批量设置粒子激活状态。"
         for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
             i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
@@ -957,6 +1109,7 @@ class PBDSolver(Solver):
         envs_idx: ti.types.ndarray(),
         actives: ti.types.ndarray(),  # shape [B, n_particles]
     ):
+        "批量读取粒子激活状态。"
         for i_p_, i_b_ in ti.ndrange(n_particles, envs_idx.shape[0]):
             i_p = i_p_ + particle_start
             i_b = envs_idx[i_b_]
@@ -964,6 +1117,7 @@ class PBDSolver(Solver):
 
     @ti.kernel
     def _kernel_fix_particles(self, particles_idx: ti.types.ndarray(), envs_idx: ti.types.ndarray()):
+        "批量固定粒子（free=False）。"
         for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
             i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
@@ -971,6 +1125,7 @@ class PBDSolver(Solver):
 
     @ti.kernel
     def _kernel_release_particle(self, particles_idx: ti.types.ndarray(), envs_idx: ti.types.ndarray()):
+        "批量释放粒子（free=True）。"
         for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
             i_p = particles_idx[i_b_, i_p_]
             i_b = envs_idx[i_b_]
@@ -980,6 +1135,7 @@ class PBDSolver(Solver):
     def _kernel_get_mass(
         self, particle_start: ti.i32, n_particles: ti.i32, mass: ti.types.ndarray(), envs_idx: ti.types.ndarray()
     ):
+        "计算一段粒子的总质量（对所有 env 相同）。"
         total_mass = gs.ti_float(0.0)
         for i_p_ in range(n_particles):
             i_p = i_p_ + particle_start
@@ -993,6 +1149,7 @@ class PBDSolver(Solver):
 
     @property
     def n_particles(self):
+        "粒子总数。"
         if self.is_built:
             return self._n_particles
         else:
@@ -1000,6 +1157,7 @@ class PBDSolver(Solver):
 
     @property
     def n_fluid_particles(self):
+        "液体粒子数量。"
         if self.is_built:
             return self._n_fluid_particles
         else:
@@ -1009,6 +1167,7 @@ class PBDSolver(Solver):
 
     @property
     def n_edges(self):
+        "边数量（用于拉伸约束）。"
         if self.is_built:
             return self._n_edges
         else:
@@ -1016,6 +1175,7 @@ class PBDSolver(Solver):
 
     @property
     def n_inner_edges(self):
+        "内边数量（用于弯曲约束）。"
         if self.is_built:
             return self._n_inner_edges
         else:
@@ -1023,6 +1183,7 @@ class PBDSolver(Solver):
 
     @property
     def n_elems(self):
+        "体单元数量（用于体积约束）。"
         if self.is_built:
             return self._n_elems
         else:
@@ -1030,6 +1191,7 @@ class PBDSolver(Solver):
 
     @property
     def n_vverts(self):
+        "可视化顶点数量。"
         if self.is_built:
             return self._n_vverts
         else:
@@ -1037,6 +1199,7 @@ class PBDSolver(Solver):
 
     @property
     def n_vfaces(self):
+        "可视化面数量。"
         if self.is_built:
             return self._n_vfaces
         else:
@@ -1044,24 +1207,30 @@ class PBDSolver(Solver):
 
     @property
     def particle_size(self):
+        "粒子直径。"
         return self._particle_size
 
     @property
     def particle_radius(self):
+        "粒子半径。"
         return self._particle_size / 2.0
 
     @property
     def hash_grid_res(self):
+        "空间哈希的网格分辨率。"
         return self.sh.grid_res
 
     @property
     def hash_grid_cell_size(self):
+        "空间哈希单元尺寸。"
         return self.sh.cell_size
 
     @property
     def upper_bound(self):
+        "边界上界。"
         return self._upper_bound
 
     @property
     def lower_bound(self):
+        "边界下界。"
         return self._lower_bound

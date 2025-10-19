@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 
 import genesis as gs
 from genesis.utils.repr import brief
@@ -37,6 +37,7 @@ class Tensor(torch.Tensor):
         parents = []
         for arg in args:
             if isinstance(arg, cls):
+                # 调试状态下，此处会因为 arg.uid 属性不存在而意外中止，非调试状态下不会
                 parents.append(arg.uid)
                 if arg.scene is not None:
                     if scene is None:

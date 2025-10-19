@@ -1,4 +1,4 @@
-import ctypes
+﻿import ctypes
 import datetime
 import functools
 import logging
@@ -36,7 +36,7 @@ LOGGER = logging.getLogger(__name__)
 class DeprecationError(Exception):
     pass
 
-
+# exception 的写法可以考虑给一个变量名，再单独定义文件使它与特定语言绑定起来
 def raise_exception(msg="Something went wrong.") -> NoReturn:
     raise gs.GenesisException(msg)
 

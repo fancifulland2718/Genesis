@@ -1,4 +1,4 @@
-import time
+﻿import time
 import argparse
 import numpy as np
 import genesis as gs
@@ -29,7 +29,8 @@ def main():
         vis_options=gs.options.VisOptions(
             show_link_frame=False,
         ),
-        show_viewer=args.vis,
+        show_viewer=True,
+        # show_viewer=args.vis,
     )
 
     ########################## entities ##########################

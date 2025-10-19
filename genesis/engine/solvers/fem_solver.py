@@ -1,4 +1,30 @@
-# pylint: disable=no-value-for-parameter
+﻿# pylint: disable=no-value-for-parameter
+"""
+FEM 有限元求解器（四面体网格）
+
+功能概述
+- 支持显式与隐式两种积分方式（由 options.use_implicit_solver 控制）
+- 显式：按 substep 顺序更新速度与位置，并支持软/硬顶点约束、重力与阻尼
+- 隐式：牛顿迭代 + 预条件共轭梯度（PCG）线性求解 + 回溯线搜索
+- 支持材料模型抽象（通过 material 回调计算应力、能量、梯度、Hessian）
+- 支持多环境（batch）并行，每个 batch 可以独立进行求解
+
+重要管线（隐式）
+1) precompute_material_data：基于上一帧位置预处理材料数据（可选）
+2) init_pos_and_inertia：初始化下一帧位置猜测与惯性项
+3) batch_solve：
+   - compute_ele_hessian_gradient：元素层面能量/梯度/Hessian
+   - accumulate_vertex_force_preconditioner：装配节点力与对角块预条件器
+   - pcg_solve：PCG 解 Ax = b 得到位移增量
+   - linesearch：回溯线搜索，保证能量下降
+4) setup_pos_vel：由位置差更新速度
+
+重要管线（显式）
+1) init_pos_and_vel：复制上帧至本帧
+2) compute_vel：由内力更新速度
+3) apply_uniform_force：施加阻尼和重力
+4) compute_pos：积分位置
+"""
 
 import numpy as np
 import igl
@@ -17,11 +43,21 @@ from .base_solver import Solver
 
 @ti.data_oriented
 class FEMSolver(Solver):
+    """
+    四面体 FEM 求解器。
+    - 负责场（field）的创建与管理（元素、顶点、表面、PCG、线搜索等）
+    - 负责时间推进（substep）流程及与实体（FEMEntity）的耦合
+    - 提供隐式/显式两类求解管线
+    """
+
     # ------------------------------------------------------------------------------------
     # --------------------------------- Initialization -----------------------------------
     # ------------------------------------------------------------------------------------
 
     def __init__(self, scene, sim, options):
+        """
+        初始化求解器，读取 options 中的数值参数、阻尼、线搜索/PCG/牛顿迭代参数等，并建立边界。
+        """
         super().__init__(scene, sim, options)
 
         # options
@@ -35,11 +71,11 @@ class FEMSolver(Solver):
         self._n_linesearch_iterations = options.n_linesearch_iterations
         self._linesearch_c = options.linesearch_c
         self._linesearch_tau = options.linesearch_tau
-        self._damping_alpha = options.damping_alpha
-        self._damping_beta = options.damping_beta
+        self._damping_alpha = options.damping_alpha  # 质量比例阻尼（Rayleigh）
+        self._damping_beta = options.damping_beta    # 刚度比例阻尼（Rayleigh）
         self._enable_vertex_constraints = options.enable_vertex_constraints
 
-        # use scaled volume for better numerical stability, similar to p_vol_scale in mpm
+        # 使用缩放体积以提升数值稳定性（与 MPM 的 p_vol_scale 类似）
         self._vol_scale = float(1e4)
 
         # materials
@@ -56,6 +92,11 @@ class FEMSolver(Solver):
         self._constraints_initialized = False
 
     def _batch_shape(self, shape=None, first_dim=False, B=None):
+        """
+        工具函数：根据 batch 大小 B 生成带 batch 维度的 shape。
+        - shape 为 None 返回 (B,)
+        - first_dim 为 True 时将 B 放在首维
+        """
         if B is None:
             B = self._B
 
@@ -67,9 +108,15 @@ class FEMSolver(Solver):
             return (B, shape) if first_dim else (shape, B)
 
     def setup_boundary(self):
+        """
+        设置场景边界（如地面高度），用于接触/摩擦等边界条件扩展。
+        """
         self.boundary = FloorBoundary(height=self._floor_height)
 
     def init_batch_fields(self):
+        """
+        初始化与 batch（环境）相关的标志与状态（PCG、线搜索）。
+        """
         self.batch_active = ti.field(
             dtype=gs.ti_bool,
             shape=self._batch_shape(),
@@ -89,11 +136,11 @@ class FEMSolver(Solver):
         )
 
         pcg_state = ti.types.struct(
-            rTr=gs.ti_float,
-            rTz=gs.ti_float,
+            rTr=gs.ti_float,    # r^T r
+            rTz=gs.ti_float,    # r^T z（z 为预条件后的残差）
             rTr_new=gs.ti_float,
             rTz_new=gs.ti_float,
-            pTAp=gs.ti_float,
+            pTAp=gs.ti_float,   # p^T A p
             alpha=gs.ti_float,
             beta=gs.ti_float,
         )
@@ -105,10 +152,10 @@ class FEMSolver(Solver):
         )
 
         linesearch_state = ti.types.struct(
-            prev_energy=gs.ti_float,
-            energy=gs.ti_float,
-            step_size=gs.ti_float,
-            m=gs.ti_float,
+            prev_energy=gs.ti_float,  # 线搜索上一步的总能量
+            energy=gs.ti_float,       # 当前尝试步长下的总能量
+            step_size=gs.ti_float,    # 步长
+            m=gs.ti_float,            # Armijo 条件中的方向导数估计
         )
 
         self.linesearch_state = linesearch_state.field(
@@ -118,6 +165,13 @@ class FEMSolver(Solver):
         )
 
     def init_element_fields(self):
+        """
+        初始化元素/顶点相关 field，包括：
+        - 顶点位置/速度
+        - 元素材料参数、几何静态信息（B 矩阵、体积、质量等）
+        - 能量/梯度/Hessian 存储
+        - PCG 所需的对角块/预条件器/向量
+        """
         # element state in vertices
         element_state_v = ti.types.struct(
             pos=gs.ti_vec3,  # position
@@ -239,6 +293,10 @@ class FEMSolver(Solver):
         )
 
     def init_surface_fields(self):
+        """
+        初始化表面（渲染/耦合）相关 field：
+        - 三角面索引、面-元素映射、可见顶点缓存等
+        """
         n_vertices_max = self.n_vertices
         n_surfaces_max = self.n_surfaces
 
@@ -277,6 +335,9 @@ class FEMSolver(Solver):
         )
 
     def _init_surface_info(self):
+        """
+        基于当前网格计算表面顶点/元素集合及其质量，用于渲染与外部耦合。
+        """
         self.vertices_on_surface = ti.field(dtype=gs.ti_bool, shape=(self.n_vertices,))
         self.elements_on_surface = ti.field(dtype=gs.ti_bool, shape=(self.n_elements,))
         self.compute_surface_vertices()
@@ -313,6 +374,9 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def compute_surface_vertices(self):
+        """
+        标记哪些顶点位于表面（被任意三角形引用）。
+        """
         for i_v in range(self.n_vertices):
             self.vertices_on_surface[i_v] = False
 
@@ -323,6 +387,9 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def compute_surface_elements(self):
+        """
+        标记哪些四面体元素属于表面元素（其任意一个顶点是表面顶点）。
+        """
         for i_e in range(self.n_elements):
             i_v = self.elements_i[i_e].el2v
             self.elements_on_surface[i_e] = (
@@ -333,20 +400,29 @@ class FEMSolver(Solver):
             )
 
     def init_ckpt(self):
+        """
+        初始化检查点容器，用于保存/恢复状态（位置、速度、激活）。
+        """
         self._ckpt = dict()
 
     def init_constraints(self):
+        """
+        初始化顶点约束数据结构。
+        - 支持硬约束（直接覆盖位置/速度）
+        - 支持软约束（弹簧/阻尼力）
+        - 支持与刚体 Link 的从属（偏移+初始化旋转）
+        """
         self._constraints_initialized = True
 
         vertex_constraint_info = ti.types.struct(
-            is_constrained=gs.ti_bool,  # boolean flag indicating if vertex is constrained
-            target_pos=gs.ti_vec3,  # target position for the constraint
-            is_soft_constraint=gs.ti_bool,  # use spring for soft constraints
-            stiffness=gs.ti_float,  # spring stiffness
-            damping=gs.ti_float,  # spring damping
-            link_idx=gs.ti_int,  # index of the rigid link (-1 if not linked)
-            link_offset_pos=gs.ti_vec3,  # offset position of link
-            link_init_quat=gs.ti_vec4,  # offset rotation of link
+            is_constrained=gs.ti_bool,  # 顶点是否被约束
+            target_pos=gs.ti_vec3,  # 目标位置（硬/软约束）
+            is_soft_constraint=gs.ti_bool,  # 是否为软约束（弹簧形式）
+            stiffness=gs.ti_float,  # 弹簧刚度
+            damping=gs.ti_float,  # 弹簧阻尼
+            link_idx=gs.ti_int,  # 刚体连杆索引（-1 表示无）
+            link_offset_pos=gs.ti_vec3,  # 相对连杆的偏移
+            link_init_quat=gs.ti_vec4,  # 初始相对旋转
         )
 
         self.vertex_constraints = vertex_constraint_info.field(
@@ -359,6 +435,9 @@ class FEMSolver(Solver):
         self.vertex_constraints.link_idx.fill(-1)
 
     def reset_grad(self):
+        """
+        将本模块内的梯度复位为 0，并通知所有实体复位各自梯度。
+        """
         self.elements_v.grad.fill(0)
         self.elements_el.grad.fill(0)
 
@@ -366,6 +445,12 @@ class FEMSolver(Solver):
             entity.reset_grad()
 
     def build(self):
+        """
+        构建阶段：
+        - 初始化 batch 字段、渲染偏移、元素/表面字段、材料构建
+        - 计算表面信息，如发现四面体顶点顺序不一致（体积符号错误）则报错
+        - 条件初始化顶点约束字段
+        """
         super().build()
         self.n_envs = self.sim.n_envs
         self._B = self.sim._B
@@ -404,6 +489,11 @@ class FEMSolver(Solver):
             self.init_constraints()
 
     def add_entity(self, idx, material, morph, surface):
+        """
+        向求解器添加一个 FEM 实体：
+        - 复用/登记材料模型回调以避免重复构建
+        - 创建并返回实体（记录其在全局数组中的起始下标）
+        """
         # add material's update methods if not matching any existing material
         exist = False
         for mat in self._mats:
@@ -436,6 +526,9 @@ class FEMSolver(Solver):
         return entity
 
     def is_active(self):
+        """
+        求解器是否有元素需要参与仿真（n_elements > 0）。
+        """
         return self.n_elements_max > 0
 
     # ------------------------------------------------------------------------------------
@@ -444,12 +537,20 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def init_pos_and_vel(self, f: ti.i32):
+        """
+        显式：将 f 帧的顶点位置/速度拷贝到 f+1 帧，作为积分前的初值。
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             self.elements_v[f + 1, i_v, i_b].pos = self.elements_v[f, i_v, i_b].pos
             self.elements_v[f + 1, i_v, i_b].vel = self.elements_v[f, i_v, i_b].vel
 
     @ti.kernel
     def compute_vel(self, f: ti.i32):
+        """
+        显式：根据材料应力计算每个元素对顶点的力，累加到速度增量上。
+        - 通过 D@B 得到形变梯度 F 与体积 J
+        - 材料回调返回一阶 Piola-Kirchhoff 应力 P，计算并施加节点力
+        """
         for i_e, i_b in ti.ndrange(self.n_elements, self._B):
             i_v0, i_v1, i_v2, i_v3 = self.elements_i[i_e].el2v
             pos_v0 = self.elements_v[f, i_v0, i_b].pos
@@ -481,7 +582,7 @@ class FEMSolver(Solver):
             for k in ti.static(range(3)):
                 force_scaled = ti.Vector([H_scaled[j, k] for j in range(3)])
 
-                # store so forces can be read out
+                # 存储力，便于外部查询
                 self.elements_v_energy[i_b, verts[k]].force = force_scaled
 
                 dv = self.substep_dt * force_scaled / mass_scaled
@@ -490,17 +591,21 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def apply_uniform_force(self, f: ti.i32):
+        """
+        显式：对速度施加均匀外力（阻尼与重力）。
+        注意：阻尼放在最前，避免对来自内力的 dv 逐元素内核中被重复处理。
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
-            # NOTE: damping should only be applied to velocity from internal force and thus come first here
-            #       given the immediate previous function call is compute_internal_vel --> however, shouldn't
-            #       be done at dv only and need to wait for all elements updated (cannot be in the compute_internal_vel kernel)
-            #       however, this inevitably damp the gravity.
+            # 指数衰减的速度阻尼
             self.elements_v[f + 1, i_v, i_b].vel *= ti.exp(-self.substep_dt * self.damping)
-            # Add gravity (avoiding damping on gravity)
+            # 重力
             self.elements_v[f + 1, i_v, i_b].vel += self.substep_dt * self._gravity[i_b]
 
     @ti.kernel
     def compute_pos(self, f: ti.i32):
+        """
+        显式：由速度积分得到位置。
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             self.elements_v[f + 1, i_v, i_b].pos = (
                 self.substep_dt * self.elements_v[f + 1, i_v, i_b].vel + self.elements_v[f, i_v, i_b].pos
@@ -508,6 +613,9 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def precompute_material_data(self, f: ti.i32):
+        """
+        隐式：预先基于上一帧位置计算一些与材料相关、可复用的数据（若材料实现需要）。
+        """
         for i_b, i_e in ti.ndrange(self._B, self.n_elements):
             J, F = self._compute_ele_J_F(f, i_e, i_b)  # use last time step's pos to compute
             for mat_idx in ti.static(self._mats_idx):
@@ -516,6 +624,10 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def init_pos_and_inertia(self, f: ti.i32):
+        """
+        隐式：初始化下一帧的未知位置与惯性项（无约束时为 x_n + v_n dt + g dt^2）。
+        若启用硬约束，则直接将对应顶点位置设置为目标位置，惯性项也相应替换。
+        """
         dt2 = self.substep_dt**2
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             if ti.static(self._enable_vertex_constraints):
@@ -540,7 +652,7 @@ class FEMSolver(Solver):
     @ti.func
     def _compute_ele_J_F(self, f: ti.i32, i_e: ti.i32, i_b: ti.i32):
         """
-        Compute the determinant (J) and deformation gradient (F) for an element.
+        计算元素的形变梯度 F 与行列式 J（基于帧 f 的顶点位置）。
         """
         i_v0, i_v1, i_v2, i_v3 = self.elements_i[i_e].el2v
         pos_v0 = self.elements_v[f, i_v0, i_b].pos
@@ -557,6 +669,10 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def compute_ele_hessian_gradient(self, f: ti.i32):
+        """
+        隐式：对每个元素计算能量密度与梯度密度（以及必要时的 Hessian）。
+        - 材料若 hessian_invariant，则后续迭代可复用（hessian_ready 标记）
+        """
         for i_b, i_e in ti.ndrange(self._B, self.n_elements):
             if not self.batch_active[i_b]:
                 continue
@@ -598,7 +714,10 @@ class FEMSolver(Solver):
     @ti.func
     def _func_compute_element_mapping_matrix(self, i_vs, B, i_b):
         """
-        Compute the element mapping matrix S for an element.
+        计算元素映射矩阵 S（4x3），用于将顶点位移映射到 F 空间：
+        - S[:3, :] = B
+        - S[3, :] = -(B[0,:] + B[1,:] + B[2,:])
+        若某顶点为硬约束点，则置对应行 0（不参与自由度）
         """
         S = ti.Matrix.zero(gs.ti_float, 4, 3)
         S[:3, :] = B
@@ -613,7 +732,7 @@ class FEMSolver(Solver):
     @ti.func
     def _func_compute_ele_energy(self, f: ti.i32):
         """
-        Compute the energy for each element in the batch. Should only be used in linesearch.
+        仅供线搜索使用：在候选位置下重算每个元素的能量（含刚度比例阻尼的线性化能量）。
         """
         for i_b, i_e in ti.ndrange(self._B, self.n_elements):
             if not self.batch_linesearch_active[i_b]:
@@ -634,7 +753,7 @@ class FEMSolver(Solver):
                         i_b=i_b,
                     )
 
-            # add linearized damping energy
+            # 线性化刚度比例阻尼能量（damping_beta）
             if self._damping_beta > gs.EPS:
                 damping_beta_over_dt = self._damping_beta / self._substep_dt
                 i_vs = self.elements_i[i_e].el2v
@@ -660,6 +779,13 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def accumulate_vertex_force_preconditioner(self, f: ti.i32):
+        """
+        隐式：装配节点力（惯性+弹性+Rayleigh 阻尼）并构建 PCG 预条件器。
+        步骤：
+        1) 惯性与质量比例阻尼（alpha）：为每个顶点设置初始力与对角块
+        2) 弹性力：根据元素梯度映射到顶点，若有刚度比例阻尼（beta），额外贡献
+        3) 预条件器：对角 3x3 块取逆作为简易预条件器（也可替换为单位/对角）
+        """
         damping_alpha_dt = self._damping_alpha * self._substep_dt
         damping_alpha_factor = damping_alpha_dt + 1.0
         damping_beta_over_dt = self._damping_beta / self._substep_dt
@@ -689,10 +815,11 @@ class FEMSolver(Solver):
             S = self._func_compute_element_mapping_matrix(i_vs, B, i_b)
             force = -V * gradient @ S.transpose()
 
-            # atomic
+            # 原子累加到顶点
             for i in ti.static(range(4)):
                 self.elements_v_energy[i_b, i_vs[i]].force += force[:, i]
 
+            # 刚度比例阻尼项（线性化）
             if self._damping_beta > gs.EPS:
                 x_diff = ti.Vector.zero(gs.ti_float, 12)
                 for i in ti.static(range(4)):
@@ -716,31 +843,34 @@ class FEMSolver(Solver):
                         -damping_beta_over_dt * V * S_H_St_x_diff[i * 3 : i * 3 + 3]
                     )
 
-            # diagonal 3-by-3 block of hessian
+            # Hessian 对角 3x3 块累加（用于预条件）
             for k, i, j in ti.ndrange(4, 3, 3):
                 self.pcg_state_v[i_b, i_vs[k]].diag3x3 += (
                     V * damping_beta_factor * S[k, i] * S[k, j] * self.elements_el_hessian[i_b, i, j, i_e]
                 )
 
-        # inverse
+        # 预条件器：对角块求逆
         for i_b, i_v in ti.ndrange(self._B, self.n_vertices):
             if not self.batch_active[i_b]:
                 continue
-            # Use 3-by-3 diagonal block inverse for preconditioner
             self.pcg_state_v[i_b, i_v].prec = self.pcg_state_v[i_b, i_v].diag3x3.inverse()
 
-            # Other options for preconditioner:
-            # Uncomment one of the following lines to test different preconditioners
-            # Use identity for preconditioner
+            # 可选预条件器：
+            # 单位阵：
             # self.pcg_state_v[i_b, i_v].prec = ti.Matrix.identity(gs.ti_float, 3)
-
-            # Use diagonal for preconditioner
+            # 仅对角：
             # self.pcg_state_v[i_b, i_v].prec = ti.Matrix([[1 / self.pcg_state_v[i_b, i_v].diag3x3[0, 0], 0, 0],
             #                                            [0, 1 / self.pcg_state_v[i_b, i_v].diag3x3[1, 1], 0],
             #                                            [0, 0, 1 / self.pcg_state_v[i_b, i_v].diag3x3[2, 2]]])
 
     @ti.func
     def compute_Ap(self):
+        """
+        计算 A p，用于 PCG：
+        A = M/dt^2*(1+alpha*dt) I + sum_e V * (1+beta/dt) S H S^T
+        - 先累加质量项
+        - 再按元素将 p 从顶点映射到 F 空间（S^T），乘 Hessian，再映射回顶点（S）
+        """
         damping_alpha_dt = self._damping_alpha * self._substep_dt
         damping_alpha_factor = damping_alpha_dt + 1.0
         damping_beta_over_dt = self._damping_beta / self._substep_dt
@@ -762,17 +892,19 @@ class FEMSolver(Solver):
 
             p9 = ti.Vector([0.0] * 9, dt=gs.ti_float)
 
+            # 顶点方向向量 p -> F 空间 9 维向量
             for i, j in ti.static(ti.ndrange(3, 4)):
                 p9[i * 3 : i * 3 + 3] = p9[i * 3 : i * 3 + 3] + S[j, i] * self.pcg_state_v[i_b, i_vs[j]].p
 
             new_p9 = ti.Vector([0.0] * 9, dt=gs.ti_float)
 
+            # 乘以元素 Hessian
             for i, j in ti.static(ti.ndrange(3, 3)):
                 new_p9[i * 3 : i * 3 + 3] = (
                     new_p9[i * 3 : i * 3 + 3] + self.elements_el_hessian[i_b, i, j, i_e] @ p9[j * 3 : j * 3 + 3]
                 )
 
-            # atomic
+            # 回写到顶点空间
             for i in ti.static(range(4)):
                 self.pcg_state_v[i_b, i_vs[i]].Ap += (
                     (S[i, 0] * new_p9[0:3] + S[i, 1] * new_p9[3:6] + S[i, 2] * new_p9[6:9]) * V * damping_beta_factor
@@ -780,6 +912,13 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def init_pcg_solve(self):
+        """
+        初始化 PCG：
+        - r = b - A x（此处 x 初值为 0，故 r = b）
+        - z = M^{-1} r（预条件）
+        - p = z
+        - 计算 rTr 与 rTz，用于步长与收敛判据
+        """
         for i_b in range(self._B):
             self.batch_pcg_active[i_b] = self.batch_active[i_b]
             if not self.batch_pcg_active[i_b]:
@@ -802,6 +941,13 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def one_pcg_iter(self):
+        """
+        执行一次 PCG 迭代：
+        1) 计算 Ap
+        2) alpha = rTz / pTAp；更新 x, r
+        3) 预条件 z = M^{-1} r；更新 rTr/rTz
+        4) 检查收敛；beta = rTz_new / rTz；更新 p = z + beta p
+        """
         self.compute_Ap()
 
         # compute pTAp
@@ -853,12 +999,21 @@ class FEMSolver(Solver):
             )
 
     def pcg_solve(self):
+        """
+        PCG 主循环：初始化后执行固定步数迭代（或由阈值提前终止）。
+        """
         self.init_pcg_solve()
         for i in range(self._n_pcg_iterations):
             self.one_pcg_iter()
 
     @ti.kernel
     def init_linesearch(self, f: ti.i32):
+        """
+        线搜索初始化：
+        - 记录当前能量（惯性+弹性）作为 prev_energy
+        - 保存当前 x_prev
+        - 计算 Armijo 条件中的 m = -grad^T x（此处用 -x·force 近似）
+        """
         for i_b in range(self._B):
             self.batch_linesearch_active[i_b] = self.batch_active[i_b]
             if not self.batch_linesearch_active[i_b]:
@@ -883,6 +1038,12 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def one_linesearch_iter(self, f: ti.i32):
+        """
+        单次线搜索迭代（回溯）：
+        - 用当前 step_size 更新位置，重算总能量（惯性+阻尼α+弹性+阻尼β）
+        - 检查 Armijo 条件：E(x+αp) <= E(x) + c α m
+        - 若不满足，则 step_size *= tau，继续回溯
+        """
         for i_b in range(self._B):
             if not self.batch_linesearch_active[i_b]:
                 continue
@@ -928,6 +1089,9 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def skip_linesearch(self, f: ti.i32):
+        """
+        不做线搜索：直接使用 PCG 解得到的位移增量更新位置。
+        """
         # Inertia, x_prev, m
         for i_b, i_v in ti.ndrange(self._B, self.n_vertices):
             if not self.batch_active[i_b]:
@@ -936,9 +1100,8 @@ class FEMSolver(Solver):
 
     def linesearch(self, f: ti.i32):
         """
-        Note
-        ------
-        https://en.wikipedia.org/wiki/Backtracking_line_search#Algorithm
+        回溯线搜索（Armijo 条件）
+        参考：https://en.wikipedia.org/wiki/Backtracking_line_search#Algorithm
         """
         if self._n_linesearch_iterations <= 0:
             self.skip_linesearch(f)
@@ -948,6 +1111,15 @@ class FEMSolver(Solver):
             self.one_linesearch_iter(f)
 
     def batch_solve(self, f: ti.i32):
+        """
+        隐式：单个 substep 的牛顿-线性化求解循环。
+        流程：
+        1) compute_ele_hessian_gradient
+        2) 标记可复用 Hessian 的材料
+        3) accumulate_vertex_force_preconditioner
+        4) pcg_solve
+        5) linesearch
+        """
         self.batch_active.fill(True)
 
         for i in range(self._n_newton_iterations):
@@ -970,6 +1142,9 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def setup_pos_vel(self, f: ti.i32):
+        """
+        隐式：由位置差分更新速度（x_{n+1} - x_n）/ dt。
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             # set pos and vel
             self.elements_v[f + 1, i_v, i_b].vel = (
@@ -981,14 +1156,25 @@ class FEMSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     def process_input(self, in_backward=False):
+        """
+        从外部输入（控制/相互作用）写入实体参数（前向）。
+        """
         for entity in self._entities:
             entity.process_input(in_backward=in_backward)
 
     def process_input_grad(self):
+        """
+        从外部输入回写梯度（反向）。
+        """
         for entity in self._entities[::-1]:
             entity.process_input_grad()
 
     def substep_pre_coupling(self, f):
+        """
+        子步（耦合前）：
+        - 隐式：预处理材料、初始化惯性与未知、牛顿迭代求解并更新速度
+        - 显式：复制状态、计算内力更新速度、施加外力、应用软约束
+        """
         if self.is_active():
             if self._use_implicit_solver:
                 self.precompute_material_data(f)
@@ -1003,6 +1189,9 @@ class FEMSolver(Solver):
                     self.apply_soft_constraints(f)
 
     def substep_pre_coupling_grad(self, f):
+        """
+        子步（耦合前，反向）：目前仅显式管线支持梯度。
+        """
         if self.is_active():
             if self._use_implicit_solver:
                 gs.raise_exception("Gradient computation is not supported for implicit solver.")
@@ -1011,17 +1200,28 @@ class FEMSolver(Solver):
             self.init_pos_and_vel.grad(f)
 
     def substep_post_coupling(self, f):
+        """
+        子步（耦合后）：
+        - 显式：位置积分与硬约束应用
+        - 隐式：位置已在 batch_solve 中更新，此处仅处理硬约束（若显式）
+        """
         if self.is_active():
             self.compute_pos(f)
             if self._constraints_initialized and not self._use_implicit_solver:
                 self.apply_hard_constraints(f)
 
     def substep_post_coupling_grad(self, f):
+        """
+        子步（耦合后，反向）：对位置积分求反向。
+        """
         if self.is_active():
             self.compute_pos.grad(f)
 
     @ti.kernel
     def copy_frame(self, source: ti.i32, target: ti.i32):
+        """
+        拷贝帧数据（pos/vel/active）从 source 到 target（含所有 batch）。
+        """
         # Copy pos/vel for all vertices and all batch indices
         for i_v, i_b in ti.ndrange(self.n_vertices_max, self._B):
             self.elements_v[target, i_v, i_b].pos = self.elements_v[source, i_v, i_b].pos
@@ -1033,6 +1233,9 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def copy_grad(self, source: ti.i32, target: ti.i32):
+        """
+        拷贝梯度帧数据（pos.grad/vel.grad/active）从 source 到 target。
+        """
         # Copy gradients for vertices
         for i_v, i_b in ti.ndrange(self.n_vertices_max, self._B):
             self.elements_v.grad[target, i_v, i_b].pos = self.elements_v.grad[source, i_v, i_b].pos
@@ -1044,6 +1247,9 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def reset_grad_till_frame(self, f: ti.i32):
+        """
+        将 0..(f-1) 帧的梯度置零（pos/vel/actu）。
+        """
         # Zero out v.grad in frame 0..(f-1) for all vertices, all batch indices
         for frame_i, vert_i, i_b in ti.ndrange(f, self.n_vertices_max, self._B):
             self.elements_v.grad[frame_i, vert_i, i_b].pos = 0
@@ -1058,10 +1264,16 @@ class FEMSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     def collect_output_grads(self):
+        """
+        将外部输出（渲染/损失）对应的梯度收集回各实体。
+        """
         for entity in self._entities:
             entity.collect_output_grads()
 
     def add_grad_from_state(self, state):
+        """
+        将外部传入的 state.grad 累加到本模块的场梯度上。
+        """
         if self.is_active():
             if state.pos.grad is not None:
                 state.pos.assert_contiguous()
@@ -1072,6 +1284,9 @@ class FEMSolver(Solver):
                 self._kernel_add_grad_from_vel(self._sim.cur_substep_local, state.vel.grad)
 
     def save_ckpt(self, ckpt_name):
+        """
+        保存检查点（帧 0），并将当前帧复制到帧 0，以便恢复。
+        """
         if self.is_active():
             if not ckpt_name in self._ckpt:
                 self._ckpt[ckpt_name] = dict()
@@ -1095,6 +1310,9 @@ class FEMSolver(Solver):
             self.copy_frame(self.sim.substeps_local, 0)
 
     def load_ckpt(self, ckpt_name):
+        """
+        恢复检查点（帧 0 到当前帧），并重置 0..(cur-1) 的梯度。
+        """
         self.copy_frame(0, self._sim.substeps_local)
         self.copy_grad(0, self._sim.substeps_local)
 
@@ -1116,10 +1334,16 @@ class FEMSolver(Solver):
     # ------------------------------------------------------------------------------------
 
     def set_state(self, f, state, envs_idx=None):
+        """
+        写入指定帧的状态（pos/vel/active）。
+        """
         if self.is_active():
             self._kernel_set_state(f, state.pos, state.vel, state.active)
 
     def get_state(self, f):
+        """
+        读取指定帧的状态，返回 FEMSolverState 对象（包含 pos/vel/active）。
+        """
         if self.is_active():
             state = FEMSolverState(self._scene)
             self._kernel_get_state(f, state.pos, state.vel, state.active)
@@ -1128,6 +1352,9 @@ class FEMSolver(Solver):
         return state
 
     def get_state_render(self, f):
+        """
+        获取渲染所需的顶点/索引缓冲（带环境偏移）。
+        """
         self.get_state_render_kernel(f)
         vertices = self.surface_render_v.vertices
         indices = self.surface_render_f.indices
@@ -1136,10 +1363,7 @@ class FEMSolver(Solver):
 
     def get_forces(self):
         """
-        Get forces on all vertices.
-
-        Returns:
-            torch.Tensor : shape (B, n_vertices, 3) where B is batch size
+        返回所有顶点的受力（形状：B x n_vertices x 3）。仅在显式 compute_vel 后更新。
         """
         if not self.is_active():
             return None
@@ -1164,6 +1388,11 @@ class FEMSolver(Solver):
         tri2v: ti.types.ndarray(),
         tri2el: ti.types.ndarray(),
     ):
+        """
+        向求解器添加一个实体的网格与材料参数（初始化顶点/元素/表面数据）。
+        - 计算每个元素的 B、体积 V、质量分配到顶点
+        - 初始化每个 batch 的元素状态（actu/active）
+        """
         n_verts_local = verts.shape[0]
         for i_v, i_b in ti.ndrange(n_verts_local, self._B):
             i_global = i_v + v_start
@@ -1235,6 +1464,9 @@ class FEMSolver(Solver):
         n_vertices: ti.i32,
         pos: ti.types.ndarray(),
     ):
+        """
+        批量设置指定实体范围内的顶点位置（帧 f）。
+        """
         for i_v, i_b in ti.ndrange(n_vertices, self._B):
             i_global = i_v + element_v_start
             for k in ti.static(range(3)):
@@ -1248,6 +1480,9 @@ class FEMSolver(Solver):
         n_vertices: ti.i32,
         pos_grad: ti.types.ndarray(),
     ):
+        """
+        批量设置指定实体范围内的顶点位置梯度（帧 f）。
+        """
         for i_v, i_b in ti.ndrange(n_vertices, self._B):
             i_global = i_v + element_v_start
             for k in ti.static(range(3)):
@@ -1261,6 +1496,9 @@ class FEMSolver(Solver):
         n_vertices: ti.i32,
         vel: ti.types.ndarray(),  # shape [B, n_vertices, 3]
     ):
+        """
+        批量设置指定实体范围内的顶点速度（帧 f）。
+        """
         for i_v, i_b in ti.ndrange(n_vertices, self._B):
             i_global = i_v + element_v_start
             for k in ti.static(range(3)):
@@ -1274,6 +1512,9 @@ class FEMSolver(Solver):
         n_vertices: ti.i32,
         vel_grad: ti.types.ndarray(),  # shape [B, n_vertices, 3]
     ):
+        """
+        批量设置指定实体范围内的顶点速度梯度（帧 f）。
+        """
         for i_v, i_b in ti.ndrange(n_vertices, self._B):
             i_global = i_v + element_v_start
             for k in ti.static(range(3)):
@@ -1288,6 +1529,9 @@ class FEMSolver(Solver):
         n_groups: ti.i32,
         actu: ti.types.ndarray(),  # shape [B, n_elements, n_groups]
     ):
+        """
+        批量设置指定实体范围内的致动参数（按肌肉分组）。
+        """
         for i_e, j_g, i_b in ti.ndrange(n_elements, n_groups, self._B):
             i_global = i_e + element_el_start
             if self.elements_i[i_global].muscle_group == j_g:
@@ -1301,6 +1545,9 @@ class FEMSolver(Solver):
         n_elements: ti.i32,
         actu_grad: ti.types.ndarray(),  # shape [B, n_elements]
     ):
+        """
+        批量设置致动参数的梯度（帧 f）。
+        """
         for i_e, i_b in ti.ndrange(n_elements, self._B):
             i_global = i_e + element_el_start
             self.elements_el.grad[f, i_global, i_b].actu = actu_grad[i_b, i_e]
@@ -1313,6 +1560,9 @@ class FEMSolver(Solver):
         n_elements: ti.i32,
         active: ti.types.ndarray(),  # shape [B, n_elements]
     ):
+        """
+        批量设置元素激活标志（帧 f）。
+        """
         for i_e, i_b in ti.ndrange(n_elements, self._B):
             i_global = i_e + element_el_start
             self.elements_el_ng[f, i_global, i_b].active = active[i_b, i_e]
@@ -1324,6 +1574,9 @@ class FEMSolver(Solver):
         n_elements: ti.i32,
         muscle_group: ti.types.ndarray(),
     ):
+        """
+        批量设置元素肌肉分组编号。
+        """
         for i_e in range(n_elements):
             i_global = i_e + element_el_start
             self.elements_i[i_global].muscle_group = muscle_group[i_e]
@@ -1335,6 +1588,9 @@ class FEMSolver(Solver):
         n_elements: ti.i32,
         muscle_direction: ti.types.ndarray(),
     ):
+        """
+        批量设置元素的肌肉方向向量。
+        """
         for i_e in range(n_elements):
             i_global = i_e + element_el_start
             for j in ti.static(range(3)):
@@ -1347,6 +1603,9 @@ class FEMSolver(Solver):
         n_elements: ti.i32,
         el2v: ti.types.ndarray(),
     ):
+        """
+        导出元素到顶点的索引映射（el2v）。
+        """
         for i_e in range(n_elements):
             i_global = i_e + element_el_start
             for j in ti.static(range(4)):
@@ -1360,6 +1619,9 @@ class FEMSolver(Solver):
         vel: ti.types.ndarray(),  # shape [B, n_vertices, 3]
         active: ti.types.ndarray(),  # shape [B, n_elements]
     ):
+        """
+        导出帧 f 的 pos/vel/active。
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             for j in ti.static(range(3)):
                 pos[i_b, i_v, j] = self.elements_v[f, i_v, i_b].pos[j]
@@ -1370,6 +1632,11 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def get_state_render_kernel(self, f: ti.i32):
+        """
+        生成渲染缓存：
+        - 顶点加入环境偏移
+        - 面索引为三角形的顶点序
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             for j in ti.static(range(3)):
                 pos_j = ti.cast(self.elements_v[f, i_v, i_b].pos[j], ti.f32)
@@ -1387,6 +1654,9 @@ class FEMSolver(Solver):
         vel: ti.types.ndarray(),  # shape [B, n_vertices, 3]
         active: ti.types.ndarray(),  # shape [B, n_elements]
     ):
+        """
+        写入帧 f 的 pos/vel/active。
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             for j in ti.static(range(3)):
                 self.elements_v[f, i_v, i_b].pos[j] = pos[i_b, i_v, j]
@@ -1397,12 +1667,18 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def _kernel_add_grad_from_pos(self, f: ti.i32, pos_grad: ti.types.ndarray()):
+        """
+        累加外部传入的 pos 梯度到场梯度（帧 f）。
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             for j in ti.static(range(3)):
                 self.elements_v.grad[f, i_v, i_b].pos[j] += pos_grad[i_b, i_v, j]
 
     @ti.kernel
     def _kernel_add_grad_from_vel(self, f: ti.i32, vel_grad: ti.types.ndarray()):
+        """
+        累加外部传入的 vel 梯度到场梯度（帧 f）。
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             for j in ti.static(range(3)):
                 self.elements_v.grad[f, i_v, i_b].vel[j] += vel_grad[i_b, i_v, j]
@@ -1413,42 +1689,52 @@ class FEMSolver(Solver):
 
     @property
     def floor_height(self):
+        "地面高度（边界条件）。"
         return self._floor_height
 
     @property
     def damping(self):
+        "显式速度指数衰减系数。"
         return self._damping
 
     @property
     def n_vertices(self):
+        "当前所有实体顶点总数。"
         return sum([entity.n_vertices for entity in self._entities])
 
     @property
     def n_elements(self):
+        "当前所有实体四面体元素总数。"
         return sum([entity.n_elements for entity in self._entities])
 
     @property
     def n_surfaces(self):
+        "当前所有实体三角形面片总数。"
         return sum([entity.n_surfaces for entity in self.entities])
 
     @property
     def n_vertices_max(self):
+        "构建时的顶点上限（用于缓冲大小）。"
         return self._n_vertices_max
 
     @property
     def n_elements_max(self):
+        "构建时的元素上限（用于缓冲大小）。"
         return self._n_elements_max
 
     @property
     def vol_scale(self):
+        "元素体积缩放因子（数值稳定性）。"
         return self._vol_scale
 
     @property
     def n_surface_vertices(self):
+        "表面顶点数量。"
         return self.surface_vertices.shape[0]
 
     @property
     def n_surface_elements(self):
+        "表面元素数量。"
         return self.surface_elements.shape[0]
 
     # ------------------------------------------------------------------------------------
@@ -1461,6 +1747,10 @@ class FEMSolver(Solver):
         links_pos: ti.template(),  # matrix field
         links_quat: ti.template(),  # matrix field
     ):
+        """
+        若约束与刚体 Link 绑定，则根据 Link 的 pos/quat 更新约束的目标位置。
+        target_pos = link_pos + quat(link) * quat(init) * offset
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             vc = self.vertex_constraints[i_v, i_b]
             if vc.is_constrained and vc.link_idx >= 0:
@@ -1474,7 +1764,9 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def apply_hard_constraints(self, f: ti.i32):
-        """Apply hard constraints by directly overriding positions and velocities."""
+        """
+        硬约束：直接覆盖顶点位置为 target_pos，并将速度清零。
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             vc = self.vertex_constraints[i_v, i_b]
             if vc.is_constrained and not vc.is_soft_constraint:
@@ -1483,7 +1775,10 @@ class FEMSolver(Solver):
 
     @ti.kernel
     def apply_soft_constraints(self, f: ti.i32):
-        """Apply soft constraints as spring forces for explicit solver."""
+        """
+        软约束（仅用于显式）：等效为弹簧+阻尼力。
+        F = -k (x - x*) - c v，取 c = 2 sqrt(k) 近似临界阻尼。
+        """
         for i_v, i_b in ti.ndrange(self.n_vertices, self._B):
             vc = self.vertex_constraints[i_v, i_b]
             if vc.is_constrained and vc.is_soft_constraint:

@@ -1,10 +1,11 @@
-import os
+﻿import os
 import pickle
 import sys
 import time
 from typing import TYPE_CHECKING, Callable
 
 import numpy as np
+# 当前文件对 torch 的依赖仅有三四个函数，均与 tensor 有关，是否可以消除直接依赖？
 import torch
 import gstaichi as ti
 from numpy.typing import ArrayLike
@@ -88,7 +89,7 @@ class Scene(RBC):
     show_FPS : bool
         Whether to show the FPS in the terminal.
     """
-
+    # 初始化信息包含了仿真器（总体、各个子仿真器、耦合器）、可视化、渲染器、文件系统等设置
     def __init__(
         self,
         sim_options: SimOptions | None = None,
@@ -214,6 +215,7 @@ class Scene(RBC):
     def __del__(self):
         self.destroy()
 
+    # 检查各个选项的类型是否正确
     def _validate_options(
         self,
         sim_options: SimOptions,
@@ -299,6 +301,8 @@ class Scene(RBC):
             self._visualizer.destroy()
             self._visualizer = None
 
+    # ----------------------------- 实体 -----------------------------
+    # 通过材质、形态、表面等信息创建实体对象，会判断对象属性，调用私有函数
     @gs.assert_unbuilt
     def add_entity(
         self,
@@ -479,6 +483,9 @@ class Scene(RBC):
         child_link._parent_idx = parent_link.idx
         parent_link._child_idxs.append(child_link.idx)
 
+    # ---------------------------------------------------------------
+    
+    # 仅光追
     @gs.assert_unbuilt
     def add_mesh_light(
         self,
@@ -521,7 +528,8 @@ class Scene(RBC):
             gs.raise_exception("Light morph only supports `gs.morphs.Primitive` or `gs.morphs.Mesh`.")
         mesh = gs.Mesh.from_morph_surface(morph, gs.surfaces.Plastic(smooth=False))
         self._visualizer.add_mesh_light(mesh, color, intensity, morph.pos, morph.quat, revert_dir, double_sided, cutoff)
-
+    
+    # 仅批渲染，似乎都不支持普通光栅化渲染器
     @gs.assert_unbuilt
     def add_light(
         self,
@@ -691,6 +699,7 @@ class Scene(RBC):
             res, pos, lookat, up, model, fov, aperture, focus_dist, GUI, spp, denoise, near, far, env_idx, debug
         )
 
+    # 流体发射器，用于创建流体对象
     @gs.assert_unbuilt
     def add_emitter(
         self,
@@ -766,6 +775,7 @@ class Scene(RBC):
         self._sim._add_force_field(force_field)
         return force_field
 
+    # 启动仿真的前置操作，会加载仿真器、可视化器、记录器等
     @gs.assert_unbuilt
     def build(
         self,
@@ -826,6 +836,8 @@ class Scene(RBC):
 
         gs.global_scene_list.add(self)
 
+    # self._envs_idx 引用了 torch.arrange ，这是一个 tensor 对象，依赖是否可以避免？
+    # 看起来比较像 DISCOVERSE 里的多环境实现
     def _parallelize(
         self,
         n_envs: int,
@@ -931,6 +943,7 @@ class Scene(RBC):
         """
         return self._get_state()
 
+    # 在仿真器步进的基础上，更新可视化器和记录器
     @gs.assert_built
     def step(self, update_visualizer=True, refresh_visualizer=True):
         """
@@ -959,6 +972,7 @@ class Scene(RBC):
         self._sim._step_grad()
         self._t -= 1
 
+    # ----------------------------- 可视化调试选项 -----------------------------
     @gs.assert_built
     def draw_debug_line(self, start, end, radius=0.002, color=(1.0, 0.0, 0.0, 0.5)):
         """
@@ -1220,6 +1234,8 @@ class Scene(RBC):
                 Ts, axis_length=frame_scaling * 0.1, origin_size=0.001, axis_radius=frame_scaling * 0.005
             )
 
+    # -----------------------------------------------------------------------        
+
     @gs.assert_built
     def render_all_cameras(
         self,
@@ -1280,6 +1296,7 @@ class Scene(RBC):
         with self._visualizer.viewer_lock:
             self._visualizer.context.clear_debug_objects()
 
+    # 操作会带来 _t 的变化，需要最后改变特定状态
     def _backward(self):
         """
         At this point, all the scene states the simulation run should have been filled with gradients.

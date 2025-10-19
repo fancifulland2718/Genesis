@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+﻿from typing import TYPE_CHECKING
 
 import numpy as np
 import gstaichi as ti
@@ -14,18 +14,14 @@ from genesis.utils.geom import ti_inv_transform_by_trans_quat, ti_transform_by_t
 if TYPE_CHECKING:
     from genesis.engine.simulator import Simulator
 
-CLAMPED_INV_DT = 50.0
+CLAMPED_INV_DT = 50.0  # 纠正速度时的最大反时间步（防止数值抖动）
 
 
 @ti.data_oriented
 class LegacyCoupler(RBC):
     """
-    This class handles all the coupling between different solvers. LegacyCoupler will be deprecated in the future.
+    传统耦合器：处理不同求解器之间的耦合交互（将被逐步废弃）。
     """
-
-    # ------------------------------------------------------------------------------------
-    # --------------------------------- Initialization -----------------------------------
-    # ------------------------------------------------------------------------------------
 
     def __init__(
         self,
@@ -35,6 +31,7 @@ class LegacyCoupler(RBC):
         self.sim = simulator
         self.options = options
 
+        # 引用各求解器实例
         self.tool_solver = self.sim.tool_solver
         self.rigid_solver = self.sim.rigid_solver
         self.avatar_solver = self.sim.avatar_solver
@@ -45,6 +42,7 @@ class LegacyCoupler(RBC):
         self.sf_solver = self.sim.sf_solver
 
     def build(self) -> None:
+        # 各类耦合开关（仅当双方都激活且选项允许时生效）
         self._rigid_mpm = self.rigid_solver.is_active() and self.mpm_solver.is_active() and self.options.rigid_mpm
         self._rigid_sph = self.rigid_solver.is_active() and self.sph_solver.is_active() and self.options.rigid_sph
         self._rigid_pbd = self.rigid_solver.is_active() and self.pbd_solver.is_active() and self.options.rigid_pbd
@@ -54,15 +52,18 @@ class LegacyCoupler(RBC):
         self._fem_mpm = self.fem_solver.is_active() and self.mpm_solver.is_active() and self.options.fem_mpm
         self._fem_sph = self.fem_solver.is_active() and self.sph_solver.is_active() and self.options.fem_sph
 
+        # MPM 与刚体（CPIC 模式）需要的中间存储
         if self._rigid_mpm and self.mpm_solver.enable_CPIC:
-            # this field stores the geom index of the thin shell rigid object (if any) that separates particle and its surrounding grid cell
+            # 存储薄壳几何对粒子与其周围网格单元的分割标记
             self.cpic_flag = ti.field(gs.ti_int, shape=(self.mpm_solver.n_particles, 3, 3, 3, self.mpm_solver._B))
+            # 粒子对应几何的法向缓存
             self.mpm_rigid_normal = ti.Vector.field(
                 3,
                 dtype=gs.ti_float,
                 shape=(self.mpm_solver.n_particles, self.rigid_solver.n_geoms_, self.mpm_solver._B),
             )
 
+        # SPH 与刚体法向缓存
         if self._rigid_sph:
             self.sph_rigid_normal = ti.Vector.field(
                 3,
@@ -75,14 +76,15 @@ class LegacyCoupler(RBC):
                 shape=(self.sph_solver.n_particles, self.rigid_solver.n_geoms_, self.sph_solver._B),
             )
 
+        # PBD 与刚体：法向缓存 + 绑定信息
         if self._rigid_pbd:
             self.pbd_rigid_normal_reordered = ti.Vector.field(
                 3, dtype=gs.ti_float, shape=(self.pbd_solver.n_particles, self.pbd_solver._B, self.rigid_solver.n_geoms)
             )
 
             struct_particle_attach_info = ti.types.struct(
-                link_idx=gs.ti_int,
-                local_pos=gs.ti_vec3,
+                link_idx=gs.ti_int,      # 绑定的刚体链节索引
+                local_pos=gs.ti_vec3,    # 粒子在链节局部坐标系的位置
             )
             pbd_batch_shape = self.pbd_solver._batch_shape(self.pbd_solver._n_particles)
 
@@ -90,19 +92,22 @@ class LegacyCoupler(RBC):
             self.particle_attach_info.link_idx.fill(-1)
             self.particle_attach_info.local_pos.fill(gs.ti_vec3(0.0, 0.0, 0.0))
 
+        # MPM 与 SPH 的空间邻域半径（以网格大小比值估算）
         if self._mpm_sph:
             self.mpm_sph_stencil_size = int(np.floor(self.mpm_solver.dx / self.sph_solver.hash_grid_cell_size) + 2)
 
+        # MPM 与 PBD 的空间邻域半径
         if self._mpm_pbd:
             self.mpm_pbd_stencil_size = int(np.floor(self.mpm_solver.dx / self.pbd_solver.hash_grid_cell_size) + 2)
 
-        ## DEBUG
+        # 调试用参数
         self._dx = 1 / 1024
         self._stencil_size = int(np.floor(self._dx / self.sph_solver.hash_grid_cell_size) + 2)
 
         self.reset(envs_idx=self.sim.scene._envs_idx)
 
     def reset(self, envs_idx=None) -> None:
+        # 清理法向缓存
         if self._rigid_mpm and self.mpm_solver.enable_CPIC:
             if envs_idx is None:
                 self.mpm_rigid_normal.fill(0)
@@ -127,6 +132,7 @@ class LegacyCoupler(RBC):
 
     @ti.func
     def _func_collide_with_rigid(self, f, pos_world, vel, mass, i_b):
+        # 针对需要耦合的刚体几何依次处理
         for i_g in range(self.rigid_solver.n_geoms):
             if self.rigid_solver.geoms_info.needs_coup[i_g]:
                 vel = self._func_collide_with_rigid_geom(pos_world, vel, mass, i_g, i_b)
@@ -134,6 +140,7 @@ class LegacyCoupler(RBC):
 
     @ti.func
     def _func_collide_with_rigid_geom(self, pos_world, vel, mass, geom_idx, batch_idx):
+        # SDF 距离
         signed_dist = sdf_decomp.sdf_func_world(
             geoms_state=self.rigid_solver.geoms_state,
             geoms_info=self.rigid_solver.geoms_info,
@@ -142,8 +149,7 @@ class LegacyCoupler(RBC):
             geom_idx=geom_idx,
             batch_idx=batch_idx,
         )
-
-        # bigger coup_softness implies that the coupling influence extends further away from the object.
+        # 耦合影响范围（越软传播越远）
         influence = ti.min(ti.exp(-signed_dist / max(1e-10, self.rigid_solver.geoms_info.coup_softness[geom_idx])), 1)
 
         if influence > 0.1:
@@ -163,7 +169,7 @@ class LegacyCoupler(RBC):
     @ti.func
     def _func_collide_with_rigid_geom_robust(self, pos_world, vel, mass, normal_prev, geom_idx, batch_idx):
         """
-        Similar to _func_collide_with_rigid_geom, but additionally handles potential side flip due to penetration.
+        更鲁棒的刚体碰撞处理（可处理部分穿透导致的法向翻转）。
         """
         signed_dist = sdf_decomp.sdf_func_world(
             geoms_state=self.rigid_solver.geoms_state,
@@ -182,28 +188,19 @@ class LegacyCoupler(RBC):
             geom_idx=geom_idx,
             batch_idx=batch_idx,
         )
-
-        # bigger coup_softness implies that the coupling influence extends further away from the object.
         influence = ti.min(ti.exp(-signed_dist / max(1e-10, self.rigid_solver.geoms_info.coup_softness[geom_idx])), 1)
 
-        # if normal_rigid.dot(normal_prev) < 0: # side flip due to penetration
-        #     influence = 1.0
-        #     normal_rigid = normal_prev
+        # 仅在影响足够大时处理
         if influence > 0.1:
             vel = self._func_collide_in_rigid_geom(pos_world, vel, mass, normal_rigid, influence, geom_idx, batch_idx)
-
-        # attraction force
-        # if 0.001 < signed_dist < 0.01:
-        #     vel = vel - normal_rigid * 0.1 * signed_dist
-
         return vel, normal_rigid
 
     @ti.func
     def _func_collide_in_rigid_geom(self, pos_world, vel, mass, normal_rigid, influence, geom_idx, batch_idx):
         """
-        Resolves collision when a particle is already in collision with a rigid object.
-        This function assumes known normal_rigid and influence.
+        已确认发生碰撞时的速度修正与动量传递。
         """
+        # 刚体参考点速度
         vel_rigid = self.rigid_solver._func_vel_at_point(
             pos_world=pos_world,
             link_idx=self.rigid_solver.geoms_info.link_idx[geom_idx],
@@ -211,17 +208,16 @@ class LegacyCoupler(RBC):
             links_state=self.rigid_solver.links_state,
         )
 
-        # v w.r.t rigid
+        # 相对速度
         rvel = vel - vel_rigid
-        rvel_normal_magnitude = rvel.dot(normal_rigid)  # negative if inward
+        rvel_normal_magnitude = rvel.dot(normal_rigid)
 
-        if rvel_normal_magnitude < 0:  # colliding
-            #################### rigid -> particle ####################
-            # tangential component
+        if rvel_normal_magnitude < 0:  # 指向内侧才处理
+            # 切向分量
             rvel_tan = rvel - rvel_normal_magnitude * normal_rigid
             rvel_tan_norm = rvel_tan.norm(gs.EPS)
 
-            # tangential component after friction
+            # 摩擦后的切向
             rvel_tan = (
                 rvel_tan
                 / rvel_tan_norm
@@ -230,20 +226,19 @@ class LegacyCoupler(RBC):
                 )
             )
 
-            # normal component after collision
+            # 法向恢复（弹性系数）
             rvel_normal = (
                 -normal_rigid * rvel_normal_magnitude * self.rigid_solver.geoms_info.coup_restitution[geom_idx]
             )
 
-            # normal + tangential component
+            # 合成新相对速度
             rvel_new = rvel_tan + rvel_normal
 
-            # apply influence
+            # 影响插值
             vel_old = vel
             vel = vel_rigid + rvel_new * influence + rvel * (1 - influence)
 
-            #################### particle -> rigid ####################
-            # Compute delta momentum and apply to rigid body.
+            # 反作用力传递给刚体
             delta_mv = mass * (vel - vel_old)
             force = -delta_mv / self.rigid_solver.substep_dt
             self.rigid_solver._func_apply_external_force(
@@ -258,6 +253,7 @@ class LegacyCoupler(RBC):
 
     @ti.func
     def _func_mpm_tool(self, f, pos_world, vel, i_b):
+        # MPM 与工具的逐实体碰撞
         for entity in ti.static(self.tool_solver.entities):
             if ti.static(entity.material.collision):
                 vel = entity.collide(f, pos_world, vel, i_b)
@@ -266,40 +262,34 @@ class LegacyCoupler(RBC):
     @ti.kernel
     def mpm_grid_op(self, f: ti.i32, t: ti.f32):
         """
-        This combines mpm's grid_op with coupling operations.
-        If we decouple grid_op with coupling with different solvers, we need to run grid-level operations for each coupling pair, which is inefficient.
+        MPM 网格操作与耦合统一执行（避免为每个耦合对重复网格遍历）。
         """
         for ii, jj, kk, i_b in ti.ndrange(*self.mpm_solver.grid_res, self.mpm_solver._B):
             I = (ii, jj, kk)
             if self.mpm_solver.grid[f, I, i_b].mass > gs.EPS:
-                #################### MPM grid op ####################
-                # Momentum to velocity
+                # 动量转速度
                 vel_mpm = (1 / self.mpm_solver.grid[f, I, i_b].mass) * self.mpm_solver.grid[f, I, i_b].vel_in
-
-                # gravity
+                # 重力
                 vel_mpm += self.mpm_solver.substep_dt * self.mpm_solver._gravity[i_b]
 
                 pos = (I + self.mpm_solver.grid_offset) * self.mpm_solver.dx
                 mass_mpm = self.mpm_solver.grid[f, I, i_b].mass / self.mpm_solver._particle_volume_scale
 
-                # external force fields
+                # 外力场
                 for i_ff in ti.static(range(len(self.mpm_solver._ffs))):
                     vel_mpm += self.mpm_solver._ffs[i_ff].get_acc(pos, vel_mpm, t, -1) * self.mpm_solver.substep_dt
 
-                #################### MPM <-> Tool ####################
+                # MPM 与工具
                 if ti.static(self.tool_solver.is_active()):
                     vel_mpm = self._func_mpm_tool(f, pos, vel_mpm, i_b)
 
-                #################### MPM <-> Rigid ####################
+                # MPM 与刚体
                 if ti.static(self._rigid_mpm and self.rigid_solver.is_active()):
                     vel_mpm = self._func_collide_with_rigid(f, pos, vel_mpm, mass_mpm, i_b)
 
-                #################### MPM <-> SPH ####################
+                # MPM 与 SPH
                 if ti.static(self._mpm_sph):
-                    # using the lower corner of MPM cell to find the corresponding SPH base cell
                     base = self.sph_solver.sh.pos_to_grid(pos - 0.5 * self.mpm_solver.dx)
-
-                    # ---------- SPH -> MPM ----------
                     sph_vel = ti.Vector([0.0, 0.0, 0.0])
                     colliding_particles = 0
                     for offset in ti.grouped(
@@ -319,10 +309,7 @@ class LegacyCoupler(RBC):
                     if colliding_particles > 0:
                         vel_old = vel_mpm
                         vel_mpm = sph_vel / colliding_particles
-
-                        # ---------- MPM -> SPH ----------
                         delta_mv = mass_mpm * (vel_mpm - vel_old)
-
                         for offset in ti.grouped(
                             ti.ndrange(self.mpm_sph_stencil_size, self.mpm_sph_stencil_size, self.mpm_sph_stencil_size)
                         ):
@@ -341,12 +328,9 @@ class LegacyCoupler(RBC):
                                         - delta_mv / self.sph_solver.particles_info_reordered[i, i_b].mass
                                     )
 
-                #################### MPM <-> PBD ####################
+                # MPM 与 PBD
                 if ti.static(self._mpm_pbd):
-                    # using the lower corner of MPM cell to find the corresponding PBD base cell
                     base = self.pbd_solver.sh.pos_to_grid(pos - 0.5 * self.mpm_solver.dx)
-
-                    # ---------- PBD -> MPM ----------
                     pbd_vel = ti.Vector([0.0, 0.0, 0.0])
                     colliding_particles = 0
                     for offset in ti.grouped(
@@ -366,10 +350,7 @@ class LegacyCoupler(RBC):
                     if colliding_particles > 0:
                         vel_old = vel_mpm
                         vel_mpm = pbd_vel / colliding_particles
-
-                        # ---------- MPM -> PBD ----------
                         delta_mv = mass_mpm * (vel_mpm - vel_old)
-
                         for offset in ti.grouped(
                             ti.ndrange(self.mpm_pbd_stencil_size, self.mpm_pbd_stencil_size, self.mpm_pbd_stencil_size)
                         ):
@@ -389,11 +370,12 @@ class LegacyCoupler(RBC):
                                             - delta_mv / self.pbd_solver.particles_info_reordered[i, i_b].mass
                                         )
 
-                #################### MPM boundary ####################
+                # MPM 边界
                 _, self.mpm_solver.grid[f, I, i_b].vel_out = self.mpm_solver.boundary.impose_pos_vel(pos, vel_mpm)
 
     @ti.kernel
     def mpm_surface_to_particle(self, f: ti.i32):
+        # 将 MPM 粒子邻近刚体表面的法向写入缓存（用于 CPIC）
         for i_p, i_b in ti.ndrange(self.mpm_solver.n_particles, self.mpm_solver._B):
             if self.mpm_solver.particles_ng[f, i_p, i_b].active:
                 for i_g in range(self.rigid_solver.n_geoms):
@@ -407,11 +389,12 @@ class LegacyCoupler(RBC):
                             geom_idx=i_g,
                             batch_idx=i_b,
                         )
-                        # we only update the normal if the particle does not the object
+                        # 仅在没有反向穿插时更新
                         if sdf_normal.dot(self.mpm_rigid_normal[i_p, i_g, i_b]) >= 0:
                             self.mpm_rigid_normal[i_p, i_g, i_b] = sdf_normal
 
     def fem_rigid_link_constraints(self):
+        # 更新 FEM 与刚体链节绑定约束
         if self.fem_solver._constraints_initialized and self.rigid_solver.is_active():
             links_pos = self.rigid_solver.links_state.pos
             links_quat = self.rigid_solver.links_state.quat
@@ -419,7 +402,7 @@ class LegacyCoupler(RBC):
 
     @ti.kernel
     def fem_surface_force(self, f: ti.i32):
-        # TODO: all collisions are on vertices instead of surface and edge
+        # 遍历 FEM 表面三角面做耦合交互
         for i_s, i_b in ti.ndrange(self.fem_solver.n_surfaces, self.fem_solver._B):
             if self.fem_solver.surface[i_s].active:
                 dt = self.fem_solver.substep_dt
@@ -434,31 +417,27 @@ class LegacyCoupler(RBC):
                 surface_normal = ti.math.cross(u, v)
                 surface_normal = surface_normal / surface_normal.norm(gs.EPS)
 
-                # FEM <-> Rigid
+                # FEM 与刚体（仅顶点级）
                 if ti.static(self._rigid_fem):
-                    # NOTE: collision only on surface vertices
                     for j in ti.static(range(3)):
                         iv = self.fem_solver.surface[i_s].tri2v[j]
                         vel_fem_sv = self._func_collide_with_rigid(
                             f,
                             self.fem_solver.elements_v[f, iv, i_b].pos,
                             self.fem_solver.elements_v[f + 1, iv, i_b].vel,
-                            mass / 3.0,  # assume element mass uniformly distributed to vertices
+                            mass / 3.0,
                             i_b,
                         )
                         self.fem_solver.elements_v[f + 1, iv, i_b].vel = vel_fem_sv
 
-                # FEM <-> MPM (interact with MPM grid instead of particles)
-                # NOTE: not doing this in mpm_grid_op otherwise we need to search for fem surface for each particles
-                #       however, this function is called after mpm boundary conditions.
+                # FEM 与 MPM（通过网格近似）
                 if ti.static(self._fem_mpm):
                     for j in ti.static(range(3)):
                         iv = self.fem_solver.surface[i_s].tri2v[j]
                         pos = self.fem_solver.elements_v[f, iv, i_b].pos
                         vel_fem_sv = self.fem_solver.elements_v[f + 1, iv, i_b].vel
-                        mass_fem_sv = mass / 4.0  # assume element mass uniformly distributed
+                        mass_fem_sv = mass / 4.0
 
-                        # follow MPM p2g scheme
                         vel_mpm = ti.Vector([0.0, 0.0, 0.0])
                         mass_mpm = 0.0
                         mpm_base = ti.floor(pos * self.mpm_solver.inv_dx - 0.5).cast(gs.ti_int)
@@ -475,10 +454,9 @@ class LegacyCoupler(RBC):
                             for d in ti.static(range(3)):
                                 mpm_weight *= mpm_w[mpm_offset[d]][d]
 
-                            # FEM -> MPM
                             mpm_grid_pos = (mpm_grid_I + self.mpm_solver.grid_offset) * self.mpm_solver.dx
                             signed_dist = (mpm_grid_pos - pos).dot(surface_normal)
-                            if signed_dist <= self.mpm_solver.dx:  # NOTE: use dx as minimal unit for collision
+                            if signed_dist <= self.mpm_solver.dx:
                                 vel_mpm_at_cell = mpm_weight * self.mpm_solver.grid[f, mpm_grid_I, i_b].vel_out
                                 mass_mpm_at_cell = mpm_weight * mpm_grid_mass
 
@@ -489,22 +467,15 @@ class LegacyCoupler(RBC):
                                     delta_mpm_vel_at_cell_unmul = (
                                         vel_fem_sv * mpm_weight - self.mpm_solver.grid[f, mpm_grid_I, i_b].vel_out
                                     )
-                                    mass_mul_at_cell = (
-                                        mpm_grid_mass / mass_fem_sv
-                                    )  # NOTE: use un-reweighted mass instead of mass_mpm_at_cell
+                                    mass_mul_at_cell = mpm_grid_mass / mass_fem_sv
                                     delta_mpm_vel_at_cell = delta_mpm_vel_at_cell_unmul * mass_mul_at_cell
                                     self.mpm_solver.grid[f, mpm_grid_I, i_b].vel_out += delta_mpm_vel_at_cell
-
                                     new_vel_fem_sv -= delta_mpm_vel_at_cell * mass_mpm_at_cell / mass_fem_sv
 
-                        # MPM -> FEM
                         if mass_mpm > gs.EPS:
-                            # delta_mv = (vel_mpm - vel_fem_sv) * mass_mpm
-                            # delta_vel_fem_sv = delta_mv / mass_fem_sv
-                            # self.fem_solver.elements_v[f + 1, iv].vel += delta_vel_fem_sv
                             self.fem_solver.elements_v[f + 1, iv, i_b].vel = new_vel_fem_sv
 
-                # FEM <-> SPH TODO: this doesn't work well
+                # FEM 与 SPH（实验性，效果较差）
                 if ti.static(self._fem_sph):
                     for j in ti.static(range(3)):
                         iv = self.fem_solver.surface[i_s].tri2v[j]
@@ -512,12 +483,10 @@ class LegacyCoupler(RBC):
                         vel_fem_sv = self.fem_solver.elements_v[f + 1, iv, i_b].vel
                         mass_fem_sv = mass / 4.0
 
-                        dx = self.sph_solver.hash_grid_cell_size  # self._dx
-                        stencil_size = 2  # self._stencil_size
-
+                        dx = self.sph_solver.hash_grid_cell_size
+                        stencil_size = 2
                         base = self.sph_solver.sh.pos_to_grid(pos - 0.5 * dx)
 
-                        # ---------- SPH -> FEM ----------
                         sph_vel = ti.Vector([0.0, 0.0, 0.0])
                         colliding_particles = 0
                         for offset in ti.grouped(ti.ndrange(stencil_size, stencil_size, stencil_size)):
@@ -534,13 +503,9 @@ class LegacyCoupler(RBC):
                         if colliding_particles > 0:
                             vel_old = vel_fem_sv
                             vel_fem_sv_unprojected = sph_vel / colliding_particles
-                            vel_fem_sv = (
-                                vel_fem_sv_unprojected.dot(surface_normal) * surface_normal
-                            )  # exclude tangential velocity
+                            vel_fem_sv = vel_fem_sv_unprojected.dot(surface_normal) * surface_normal
 
-                            # ---------- FEM -> SPH ----------
                             delta_mv = mass_fem_sv * (vel_fem_sv - vel_old)
-
                             for offset in ti.grouped(ti.ndrange(stencil_size, stencil_size, stencil_size)):
                                 slot_idx = self.sph_solver.sh.grid_to_slot(base + offset)
                                 for k in range(
@@ -556,7 +521,7 @@ class LegacyCoupler(RBC):
 
                             self.fem_solver.elements_v[f + 1, iv, i_b].vel = vel_fem_sv
 
-                # boundary condition
+                # 边界速度约束
                 for j in ti.static(range(3)):
                     iv = self.fem_solver.surface[i_s].tri2v[j]
                     _, self.fem_solver.elements_v[f + 1, iv, i_b].vel = self.fem_solver.boundary.impose_pos_vel(
@@ -564,13 +529,12 @@ class LegacyCoupler(RBC):
                     )
 
     def fem_hydroelastic(self, f: ti.i32):
-        # Floor contact
-
-        # collision detection
+        # 地面接触（流固/柔体水弹特征检测）
         self.fem_solver.floor_hydroelastic_detection(f)
 
     @ti.kernel
     def sph_rigid(self, f: ti.i32):
+        # SPH 与刚体碰撞（鲁棒法向）
         for i_p, i_b in ti.ndrange(self.sph_solver._n_particles, self.sph_solver._B):
             if self.sph_solver.particles_ng_reordered[i_p, i_b].active:
                 for i_g in range(self.rigid_solver.n_geoms):
@@ -589,9 +553,9 @@ class LegacyCoupler(RBC):
 
     @ti.kernel
     def kernel_pbd_rigid_collide(self):
+        # PBD 与刚体的简单位置-速度校正
         for i_p, i_b in ti.ndrange(self.pbd_solver._n_particles, self.sph_solver._B):
             if self.pbd_solver.particles_ng_reordered[i_p, i_b].active:
-                # NOTE: Couldn't figure out a good way to handle collision with non-free particle. Such collision is not phsically plausible anyway.
                 for i_g in range(self.rigid_solver.n_geoms):
                     if self.rigid_solver.geoms_info.needs_coup[i_g]:
                         (
@@ -617,9 +581,7 @@ class LegacyCoupler(RBC):
         links_state: LinksState,
     ) -> None:
         """
-        Sets listed particles in listed environments to be animated by the link.
-
-        Current position of the particle, relatively to the link, is stored and preserved.
+        绑定指定环境中给定粒子到某链节（记录其相对局部位置用于后续动画驱动）。
         """
         pdb = self.pbd_solver
 
@@ -629,11 +591,9 @@ class LegacyCoupler(RBC):
             link_pos = links_state.pos[link_idx, i_b]
             link_quat = links_state.quat[link_idx, i_b]
 
-            # compute local offset from link to the particle
             world_pos = pdb.particles[i_p, i_b].pos
             local_pos = ti_inv_transform_by_trans_quat(world_pos, link_pos, link_quat)
 
-            # set particle to be animated (not free) and store animation info
             pdb.particles[i_p, i_b].free = False
             self.particle_attach_info[i_p, i_b].link_idx = link_idx
             self.particle_attach_info[i_p, i_b].local_pos = local_pos
@@ -644,7 +604,9 @@ class LegacyCoupler(RBC):
         particles_idx: ti.types.ndarray(),
         envs_idx: ti.types.ndarray(),
     ) -> None:
-        """Detach listed particles from links, and simulate them freely."""
+        """
+        解除粒子与链节绑定，恢复自由模拟。
+        """
         pdb = self.pbd_solver
         for i_p_, i_b_ in ti.ndrange(particles_idx.shape[1], envs_idx.shape[0]):
             i_p = particles_idx[i_b_, i_p_]
@@ -656,21 +618,11 @@ class LegacyCoupler(RBC):
     @ti.kernel
     def kernel_pbd_rigid_solve_animate_particles_by_link(self, clamped_inv_dt: ti.f32, links_state: LinksState):
         """
-        Itearates all particles and environments, and sets corrective velocity for all animated particle.
-
-        Computes target position and velocity from the attachment/reference link and local offset position.
-
-        Note, that this step shoudl be done after rigid solver update, and before PDB solver update.
-        Currently, this is done after both rigid and PBD solver updates, hence the corrective velocity
-        is off by a frame.
-
-        Note, it's adviced to clamp inv_dt to avoid large jerks and instability. 1/0.02 might be a good max value.
+        根据链节最新状态为绑定粒子施加“纠正速度”，使其追随链节运动（位置滞后一帧）。
         """
         pdb = self.pbd_solver
         for i_p, i_env in ti.ndrange(pdb._n_particles, pdb._B):
             if self.particle_attach_info[i_p, i_env].link_idx >= 0:
-
-                # read link state
                 link_idx = self.particle_attach_info[i_p, i_env].link_idx
                 link_pos = links_state.pos[link_idx, i_env]
                 link_quat = links_state.quat[link_idx, i_env]
@@ -679,14 +631,12 @@ class LegacyCoupler(RBC):
                 link_ang_vel = links_state.cd_ang[link_idx, i_env]
                 link_com_in_world = links_state.root_COM[link_idx, i_env] + links_state.i_pos[link_idx, i_env]
 
-                # calculate target pos and vel of the particle
                 local_pos = self.particle_attach_info[i_p, i_env].local_pos
                 target_world_pos = ti_transform_by_trans_quat(local_pos, link_pos, link_quat)
 
                 world_arm = target_world_pos - link_com_in_world
                 target_world_vel = link_lin_vel + link_ang_vel.cross(world_arm)
 
-                # compute and apply corrective velocity
                 i_rp = pdb.particles_ng[i_p, i_env].reordered_idx
                 particle_pos = pdb.particles_reordered[i_rp, i_env].pos
                 pos_correction = target_world_pos - particle_pos
@@ -697,8 +647,7 @@ class LegacyCoupler(RBC):
     @ti.func
     def _func_pbd_collide_with_rigid_geom(self, i, pos_world, vel, mass, normal_prev, geom_idx, batch_idx):
         """
-        Resolves collision when a particle is already in collision with a rigid object.
-        This function assumes known normal_rigid and influence.
+        PBD 粒子与刚体的穿透修正（位置校正 + 作用力回传）。
         """
         signed_dist = sdf_decomp.sdf_func_world(
             geoms_state=self.rigid_solver.geoms_state,
@@ -725,25 +674,13 @@ class LegacyCoupler(RBC):
         )
         new_pos = pos_world
         new_vel = vel
-        if signed_dist < self.pbd_solver.particle_size / 2:  # skip non-penetration particles
-
-            stiffness = 1.0  # value in [0, 1]
-
-            # we don't consider friction for now
-            # friction = 0.15
-            # rvel = vel - vel_rigid
-            # rvel_normal_magnitude = rvel.dot(contact_normal)  # negative if inward
-            # rvel_tan = rvel - rvel_normal_magnitude * contact_normal
-            # rvel_tan_norm = rvel_tan.norm(gs.EPS)
-
-            #################### rigid -> particle ####################
-
-            energy_loss = 0.0  # value in [0, 1]
+        if signed_dist < self.pbd_solver.particle_size / 2:
+            stiffness = 1.0
+            energy_loss = 0.0
             new_pos = pos_world + stiffness * contact_normal * (self.pbd_solver.particle_size / 2 - signed_dist)
             prev_pos = self.pbd_solver.particles_reordered[i, batch_idx].ipos
             new_vel = (new_pos - prev_pos) / self.pbd_solver._substep_dt
 
-            #################### particle -> rigid ####################
             delta_mv = mass * (new_vel - vel)
             force = (-delta_mv / self.rigid_solver._substep_dt) * (1 - energy_loss)
 
@@ -758,24 +695,20 @@ class LegacyCoupler(RBC):
         return new_pos, new_vel, contact_normal
 
     def preprocess(self, f):
-        # preprocess for MPM CPIC
+        # 预处理：MPM CPIC 下将法向写入缓冲
         if self.mpm_solver.is_active() and self.rigid_solver.is_active() and self.mpm_solver.enable_CPIC:
             self.mpm_surface_to_particle(f)
 
     def couple(self, f):
-        # MPM <-> all others
+        # 统一调度各耦合步骤
         if self.mpm_solver.is_active():
             self.mpm_grid_op(f, self.sim.cur_t)
 
-        # SPH <-> Rigid
         if self._rigid_sph and self.rigid_solver.is_active():
             self.sph_rigid(f)
 
-        # PBD <-> Rigid
         if self._rigid_pbd and self.rigid_solver.is_active():
             self.kernel_pbd_rigid_collide()
-
-            # 1-way: animate particles by links
             full_step_inv_dt = 1.0 / self.pbd_solver._dt
             clamped_inv_dt = min(full_step_inv_dt, CLAMPED_INV_DT)
             self.kernel_pbd_rigid_solve_animate_particles_by_link(clamped_inv_dt, self.rigid_solver.links_state)
@@ -785,6 +718,7 @@ class LegacyCoupler(RBC):
             self.fem_rigid_link_constraints()
 
     def couple_grad(self, f):
+        # 反向传播版本（目前仅对少数核启用）
         if self.mpm_solver.is_active():
             self.mpm_grid_op.grad(f, self.sim.cur_t)
 
@@ -793,5 +727,5 @@ class LegacyCoupler(RBC):
 
     @property
     def active_solvers(self):
-        """All the active solvers managed by the scene's simulator."""
+        """当前激活的求解器集合（来自上层模拟器）。"""
         return self.sim.active_solvers

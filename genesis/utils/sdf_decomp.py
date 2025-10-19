@@ -8,7 +8,20 @@ import genesis.utils.array_class as array_class
 
 @ti.data_oriented
 class SDF:
+    """Signed Distance Field (SDF) helper for rigid solver.
+
+    刚体求解器的 SDF 工具类。
+    - 管理每个几何体的 SDF 网格及其元数据（分辨率、体素起始索引、最大值、单元尺寸等）。
+    - 在构造时将 Python/Numpy 侧数据拷入 Taichi 结构化字段，供后续核函数查询。
+    """
+
     def __init__(self, rigid_solver):
+        """Initialize SDF fields from solver geoms.
+
+        从求解器的几何体初始化 SDF 字段与信息。
+        - 收集每个 geom 的 SDF 体素网格、梯度网格、最近顶点、变换矩阵等。
+        - 一次性打包为 Taichi 字段，避免运行时重复组装。
+        """
         self.solver = rigid_solver
 
         n_geoms, n_cells = self.solver.n_geoms, self.solver.n_cells
@@ -45,6 +58,13 @@ def sdf_kernel_init_geom_fields(
     static_rigid_sim_config: ti.template(),
     sdf_info: array_class.SDFInfo,
 ):
+    """Copy per-geom SDF metadata/volumes from NumPy into Taichi fields.
+
+    将每个几何体的 SDF 元数据与体素数据从 NumPy 拷贝到 Taichi 字段。
+    - geoms_info（每几何体一次）：变换矩阵/分辨率/单元起始索引/最大 SDF 值/单元尺寸。
+    - 体素级数组（所有几何体串接）：sdf 值、梯度、最近顶点索引。
+    - 使用 loop_config 控制串行/并行以减少编译与调度开销。
+    """
     n_geoms = sdf_info.geoms_sdf_start.shape[0]
     n_cells = sdf_info.geoms_sdf_val.shape[0]
 
@@ -76,8 +96,13 @@ def sdf_func_world(
     geom_idx,
     batch_idx,
 ):
-    """
-    sdf value from world coordinate
+    """Evaluate SDF value in world frame.
+
+    在世界坐标系下评估给定点相对指定几何体的 SDF 值。
+    - 根据几何类型分支计算：
+      * 球：中心距离减去半径；
+      * 平面：将点变换到网格坐标后做法向投影；
+      * 其它网格：点 → mesh → sdf 帧，再用体素网格插值。
     """
 
     g_pos = geoms_state.pos[geom_idx, batch_idx]
@@ -103,9 +128,11 @@ def sdf_func_world(
 
 @ti.func
 def sdf_func_sdf(sdf_info: array_class.SDFInfo, pos_sdf, geom_idx):
-    """
-    sdf value at sdf frame coordinate.
-    Note that the stored sdf magnitude is already w.r.t world/mesh frame.
+    """Evaluate SDF value in sdf-frame (voxel space).
+
+    在 SDF 帧（体素坐标）下求 SDF 值。
+    - 若采样点在 SDF 体素外，使用 proxy（到中心距离+偏置）保证值上界；
+    - 否则用体素值进行三线性插值（true sdf）。
     """
     signed_dist = gs.ti_float(0.0)
     if sdf_func_is_outside_sdf_grid(sdf_info, pos_sdf, geom_idx):
@@ -117,14 +144,20 @@ def sdf_func_sdf(sdf_info: array_class.SDFInfo, pos_sdf, geom_idx):
 
 @ti.func
 def sdf_func_is_outside_sdf_grid(sdf_info: array_class.SDFInfo, pos_sdf, geom_idx):
+    """Check if a sdf-frame point lies outside the valid voxel range.
+
+    判断采样点是否在 SDF 网格有效范围之外（用于切换 proxy/true 路径）。
+    """
     res = sdf_info.geoms_info.sdf_res[geom_idx]
     return (pos_sdf >= res - 1).any() or (pos_sdf <= 0).any()
 
 
 @ti.func
 def sdf_func_proxy_sdf(sdf_info: array_class.SDFInfo, pos_sdf, geom_idx):
-    """
-    Use distance to center as a proxy sdf, strictly greater than any point inside the cube to ensure value comparison is valid. Only considers region outside of cube.
+    """Proxy SDF used outside the cube.
+
+    网格外部的代理 SDF：以到网格中心距离为近似，并加上 sdf_max 使其严格大于网格内值。
+    - 确保在最小化/比较时不误选到网格外的点。
     """
     center = (sdf_info.geoms_info.sdf_res[geom_idx] - 1) / 2.0
     sd = (pos_sdf - center).norm() / sdf_info.geoms_info.sdf_cell_size[geom_idx]
@@ -133,8 +166,13 @@ def sdf_func_proxy_sdf(sdf_info: array_class.SDFInfo, pos_sdf, geom_idx):
 
 @ti.func
 def sdf_func_true_sdf(sdf_info: array_class.SDFInfo, pos_sdf, geom_idx):
-    """
-    True sdf interpolated using stored sdf grid.
+    """True SDF via trilinear interpolation over the voxel grid.
+
+    通过体素网格对真实 SDF 进行三线性插值。
+    管线：
+    1) 取 base=floor(pos) 并裁剪到 [0, res-2]；
+    2) 遍历 8 个体素角点，计算每一角的权重 w=(1-|dx|)(1-|dy|)(1-|dz|)；
+    3) 加权求和得到 signed_dist。
     """
     geom_sdf_res = sdf_info.geoms_info.sdf_res[geom_idx]
     base = ti.min(ti.floor(pos_sdf, gs.ti_int), geom_sdf_res - 2)
@@ -153,6 +191,10 @@ def sdf_func_true_sdf(sdf_info: array_class.SDFInfo, pos_sdf, geom_idx):
 
 @ti.func
 def sdf_func_ravel_cell_idx(sdf_info: array_class.SDFInfo, cell_idx, sdf_res, geom_idx):
+    """Compute flattened index of a 3D voxel coordinate.
+
+    将 3D 体素坐标按行主序压平成一维索引（带每几何体的起始偏移）。
+    """
     return (
         sdf_info.geoms_info.sdf_cell_start[geom_idx]
         + cell_idx[0] * sdf_res[1] * sdf_res[2]
@@ -171,6 +213,13 @@ def sdf_func_grad_world(
     geom_idx,
     batch_idx,
 ):
+    """Evaluate SDF gradient (world frame).
+
+    计算世界坐标系下的 SDF 梯度（法向未单位化）。
+    - 球/平面：可解析表达式；
+    - 网格：点从 world→mesh→sdf，求 sdf 帧梯度后再旋转回 world。
+    """
+
     g_pos = geoms_state.pos[geom_idx, batch_idx]
     g_quat = geoms_state.quat[geom_idx, batch_idx]
 
@@ -201,10 +250,15 @@ def sdf_func_grad(
     pos_sdf,
     geom_idx,
 ):
+    """Evaluate SDF gradient in sdf-frame.
+
+    在 SDF 帧下计算梯度：
+    - 网格外：使用指向中心的单位向量作为近似方向（proxy）;
+    - 网格内：
+      * Terrain 类型：用有限差分（两侧差商）计算；
+      * 其它类型：从预存梯度体素以三线性插值恢复。
     """
-    sdf grad at sdf frame coordinate.
-    Note that the stored sdf magnitude is already w.r.t world/mesh frame.
-    """
+
     grad_sdf = ti.Vector.zero(gs.ti_float, 3)
     if sdf_func_is_outside_sdf_grid(sdf_info, pos_sdf, geom_idx):
         grad_sdf = sdf_func_proxy_grad(sdf_info, pos_sdf, geom_idx)
@@ -215,9 +269,9 @@ def sdf_func_grad(
 
 @ti.func
 def sdf_func_proxy_grad(sdf_info: array_class.SDFInfo, pos_sdf, geom_idx):
-    """
-    Use direction to sdf center to approximate gradient direction.
-    Only considers region outside of cube.
+    """Approximate gradient direction by vector to grid center (outside only).
+
+    在网格外，使用“指向 SDF 网格中心的单位向量”近似梯度方向。
     """
     center = (sdf_info.geoms_info.sdf_res[geom_idx] - 1) / 2.0
     proxy_sdf_grad = gu.ti_normalize(pos_sdf - center)
@@ -232,9 +286,16 @@ def sdf_func_true_grad(
     pos_sdf,
     geom_idx,
 ):
+    """True gradient either by finite-difference (Terrain) or trilinear interpolation of precomputed gradients.
+
+    真实梯度计算：
+    - Terrain：对 true_sdf 做三维有限差分（步长较大以加速/稳定）;
+    - 其它：对预存梯度体素做三线性插值，得到连续梯度。
+    实现要点：
+    1) 取 base=floor(pos) 并裁剪到 [0, res-2]；
+    2) 遍历 8 个角点并累计权重加权的梯度向量。
     """
-    True sdf grad interpolated using stored sdf grad grid.
-    """
+
     sdf_grad_sdf = ti.Vector.zero(gs.ti_float, 3)
     if geoms_info.type[geom_idx] == gs.GEOM_TYPE.TERRAIN:  # Terrain uses finite difference
         if ti.static(collider_static_config.has_terrain):  # for speed up compilation
@@ -275,6 +336,10 @@ def sdf_func_normal_world(
     geom_idx,
     batch_idx,
 ):
+    """Compute normalized SDF normal in world frame.
+
+    返回世界系中的单位法向（对梯度归一化）。
+    """
     return gu.ti_normalize(
         sdf_func_grad_world(geoms_state, geoms_info, collider_static_config, sdf_info, pos_world, geom_idx, batch_idx)
     )
@@ -289,9 +354,15 @@ def sdf_func_find_closest_vert(
     geom_idx,
     i_b,
 ):
+    """Return the closest mesh vertex (global index) to a world-space query.
+
+    返回给定世界坐标点在指定几何体上的最近网格顶点（全局顶点索引）。
+    管线：
+    1) world→mesh→sdf 坐标变换；
+    2) 将浮点体素坐标裁剪到有效范围并取最近整格；
+    3) 用 ravel 后的体素索引查询“最近顶点表”，再加上 geom 的顶点起始偏移得到全局索引。
     """
-    Returns vert of geom that's closest to pos_world
-    """
+
     g_pos = geoms_state.pos[geom_idx, i_b]
     g_quat = geoms_state.quat[geom_idx, i_b]
     geom_sdf_res = sdf_info.geoms_info.sdf_res[geom_idx]
